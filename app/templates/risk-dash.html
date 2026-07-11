@@ -29,6 +29,12 @@
 
 <script src="/static/dashboard.js"></script>
 <script>
+  // Profile stashed at login — comes from base_dataset.json
+  let JSON_PROFILE = null;
+  try { JSON_PROFILE = JSON.parse(sessionStorage.getItem('login_profile') || 'null'); } catch (_) {}
+  const PROVIDER_NAME_LOOKUP = { '1': 'bKash', '2': 'Nagad', '3': 'Rocket',
+                                  bkash: 'bKash', nagad: 'Nagad', rocket: 'Rocket' };
+
   async function render() {
     const main = document.getElementById('content');
     main.innerHTML = '<div class="empty">Loading…</div>';
@@ -37,6 +43,11 @@
       const an = data.analyst;
       document.getElementById('analyst-name').textContent = an.name;
       document.getElementById('provider-pill').textContent = `${an.provider} · ${an.division}`;
+
+      // Prefer JSON profile for header chips
+      const p = (JSON_PROFILE && JSON_PROFILE.profile) || {};
+      const headerName = p.name || an.name;
+      const jsonProvider = p.provider_id ? PROVIDER_NAME_LOOKUP[p.provider_id] : null;
 
       const f = data.funnel;
       const tickets = data.tickets;
@@ -61,8 +72,23 @@
         </tr>
       `).join('');
 
+      // Static profile block from JSON
+      const profileBlock = `
+        <div class="card" style="margin-bottom:1rem;">
+          <h2>Static Profile <small style="color:var(--text-dim);font-weight:400;">from base_dataset.json</small></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem 1.25rem;font-size:0.9rem;">
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Analyst Name</div><div>${DASH.escapeHtml(headerName)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Provider</div><div>${DASH.escapeHtml(jsonProvider || an.provider)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Division</div><div>${DASH.escapeHtml(p.div_id || an.division)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Offices Under Review</div><div><strong>${data.office_count}</strong></div></div>
+          </div>
+        </div>
+      `;
+
       main.innerHTML = `
-        <h1 class="section-title">Risk Analyst <small>${DASH.escapeHtml(an.name)} · ${DASH.escapeHtml(an.provider)} · ${DASH.escapeHtml(an.division)}</small></h1>
+        <h1 class="section-title">Risk Analyst <small>${DASH.escapeHtml(headerName)} · ${DASH.escapeHtml(jsonProvider || an.provider)} · ${DASH.escapeHtml(p.div_id || an.division)}</small></h1>
+
+        ${profileBlock}
 
         <div class="grid cols-4" style="margin-bottom:1rem;">
           <div class="card"><div class="metric"><div class="v">${data.office_count}</div><div class="l">Offices Under Review</div></div></div>

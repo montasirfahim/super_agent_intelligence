@@ -18,6 +18,7 @@
       <span class="name" id="shop-name">—</span>
     </div>
     <div class="actions">
+      <button id="reset-sim-btn" title="Reset physical-cash ledger back to starting balance">↺ Reset Sim</button>
       <button id="refresh-btn">↻ Refresh</button>
       <a href="/">Sign out</a>
     </div>
@@ -30,6 +31,31 @@
 <script>
   const fmtBDT = (n) => '৳' + Math.round(n).toLocaleString('en-IN');
 
+  // Profile stashed at login
+  let JSON_PROFILE = null;
+  try { JSON_PROFILE = JSON.parse(sessionStorage.getItem('login_profile') || 'null'); } catch (_) {}
+
+  // ---------- Live physical-cash simulation ----------
+  // Seed the ledger from the agent's starting cash (e.g. ৳500,000 for agent1).
+  // Every poll, we diff new CASH_OUT / CASH_IN transactions and deduct/add to
+  // the running balance client-side. This makes the agent's drawer visibly
+  // drain as new live txns arrive — the simulation engine's main user signal.
+  const STARTING_CASH = (JSON_PROFILE && JSON_PROFILE.profile
+                         && typeof JSON_PROFILE.profile.shared_physical_cash === 'number')
+                        ? JSON_PROFILE.profile.shared_physical_cash
+                        : 0;
+  const liveCash = DASH.LiveCash.create({ starting_cash: STARTING_CASH });
+
+  // ---------- Live provider-wallet simulation ----------
+  // One ledger per provider wallet, seeded from base_dataset.json's
+  // "providerwallet" array (passed through login_profile.profile.provider_wallets).
+  // Each new txn is routed to its provider's ledger and added to the running balance.
+  const JSON_WALLETS = (JSON_PROFILE && JSON_PROFILE.profile
+                        && Array.isArray(JSON_PROFILE.profile.provider_wallets))
+                       ? JSON_PROFILE.profile.provider_wallets
+                       : [];
+  const liveWallet = DASH.LiveWallet.create(JSON_WALLETS);
+
   async function render() {
     const main = document.getElementById('content');
     main.innerHTML = '<div class="empty">Loading…</div>';
@@ -38,47 +64,82 @@
       const a = data.agent;
       document.getElementById('shop-name').textContent = a.shop_name;
 
-      const phys = data.physical;
-      const sevClass = (s) => `sev-${s}`;
-      const providerClass = (id) => id === '1' ? 'bkash' : id === '2' ? 'nagad' : 'rocket';
+      // Apply the latest transaction list to both ledgers
+      const applied = liveCash.applyBatch(data.recent_transactions || []);
+      liveWallet.applyBatch(data.recent_transactions || []);
+      const snap = liveCash.snapshot();
+      const walletSnap = liveWallet.snapshotAll();
 
-      const balanceCards = `
+      // Header chips — prefer JSON profile values
+      const p = (JSON_PROFILE && JSON_PROFILE.profile) || {};
+      const headerShop  = p.shop_name  || a.shop_name;
+      const headerArea  = p.area       || a.area;
+      const headerDist  = p.district   || a.district;
+      const jsonSpc     = (typeof p.shared_physical_cash === 'number') ? p.shared_physical_cash : null;
+
+      const sevClass = (s) => `sev-${s}`;
+
+      // Live balance card — the headline physical cash number now comes from
+      // the client-side ledger, not from the DB column. This makes the
+      // "drained by Eid-eve cash-outs" story visible to judges.
+      const liveBalance = snap.balance;
+      const isDraining = snap.deductions > snap.additions;
+      const liveAccent = isDraining ? 'var(--red)' : 'var(--green)';
+
+      const physicalCard = `
         <div class="balance-card physical">
           <div class="label">Shared Physical Cash Drawer</div>
-          <div class="amount">${DASH.escapeHtml(phys.balance_fmt)}</div>
+          <div class="amount" style="color:${liveAccent};transition:color 0.4s;">${fmtBDT(liveBalance)}</div>
           <div class="meta">
-            <span>Outflow: ${fmtBDT(phys.outflow_velocity)}/min</span>
-            <span>Inflow: ${fmtBDT(phys.inflow_velocity)}/min</span>
+            <span title="Starting balance at login">Starting: <strong>${fmtBDT(snap.starting)}</strong></span>
           </div>
           <div class="runway">
-            <span>Runway: <strong>${phys.t_runaway_fmt}</strong></span>
-            <span class="badge ${sevClass(phys.severity)}">${phys.severity}</span>
+            <span title="Total cash-outs applied to ledger">−${fmtBDT(snap.deductions)} <small style="opacity:0.6;">(${snap.tx_count} txns)</small></span>
+            <span title="Total cash-ins applied to ledger" style="color:var(--green);">+${fmtBDT(snap.additions)}</span>
+          </div>
+          <div class="runway">
+            <span>Net movement: <strong style="color:${isDraining ? 'var(--red)' : 'var(--green)'};">${fmtBDT(snap.additions - snap.deductions)}</strong></span>
+            <span class="badge ${sevClass('LOW')}">${isDraining ? 'DRAINING' : 'STABLE'}</span>
+          </div>
+          ${applied.newCount > 0 ? `
+            <div class="runway" style="background:rgba(56,189,248,0.08);padding:0.4rem 0.6rem;border-radius:6px;margin-top:0.4rem;">
+              <span style="color:var(--accent);font-size:0.78rem;">
+                ⚡ This poll: ${applied.newCount} new txn${applied.newCount === 1 ? '' : 's'}
+                (${applied.newDeductions > 0 ? '−' + fmtBDT(applied.newDeductions) : ''}${applied.newAdditions > 0 ? ' +' + fmtBDT(applied.newAdditions) : ''})
+              </span>
+            </div>
+          ` : ''}
+        </div>
+      `;
+
+      const balanceCards = physicalCard + Object.entries(walletSnap.per).map(([pkey, w]) => {
+        const isDrainingW = w.deductions > w.additions;
+        const accentW = isDrainingW ? 'var(--red)' : 'var(--green)';
+        return `
+        <div class="balance-card ${pkey}">
+          <div class="label">${w.provider_name} E-Money</div>
+          <div class="amount" style="color:${accentW};transition:color 0.4s;">${fmtBDT(w.balance)}</div>
+          <div class="meta">
+            <span title="Starting balance from base_dataset.json">Starting: <strong>${fmtBDT(w.starting)}</strong></span>
+          </div>
+          <div class="runway">
+            <span title="Total cash-outs applied to this wallet">−${fmtBDT(w.deductions)} <small style="opacity:0.6;">(${w.tx_count} txns)</small></span>
+            <span title="Total cash-ins applied to this wallet" style="color:var(--green);">+${fmtBDT(w.additions)}</span>
+          </div>
+          <div class="runway">
+            <span>Net: <strong style="color:${isDrainingW ? 'var(--red)' : 'var(--green)'};">${fmtBDT(w.additions - w.deductions)}</strong></span>
+            <span class="badge ${sevClass('LOW')}">${isDrainingW ? 'DRAINING' : 'STABLE'}</span>
           </div>
         </div>
-        ${data.wallets.map(w => `
-          <div class="balance-card ${providerClass(w.provider_id)}">
-            <div class="label">${w.provider_name} E-Money</div>
-            <div class="amount">${DASH.escapeHtml(w.balance_fmt)}</div>
-            <div class="meta">
-              <span>Last sync: ${w.last_sync_time}</span>
-              <span>${w.has_wallet ? '' : '<em>No wallet</em>'}</span>
-            </div>
-            ${w.has_wallet ? `
-              <div class="runway">
-                <span>Runway: <strong>${w.t_runaway_fmt}</strong></span>
-                <span class="badge ${sevClass(w.severity)}">${w.severity}</span>
-              </div>
-            ` : ''}
-          </div>
-        `).join('')}
       `;
+      }).join('');
 
       const txns = data.recent_transactions.map(t => `
         <tr>
           <td><code>${t.timestamp}</code></td>
           <td>${t.provider}</td>
           <td>${t.type.replace('_', '-')}</td>
-          <td style="text-align:right;font-variant-numeric:tabular-nums;">${t.amount_fmt}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;color:${t.type === 'CASH_OUT' ? 'var(--red)' : 'var(--green)'};">${t.amount_fmt}</td>
           <td><code title="${t.customer_hash_short}">${t.customer_hash_short.slice(0, 10)}…</code></td>
         </tr>
       `).join('');
@@ -99,8 +160,23 @@
             </div>
           `).join('');
 
+      // Profile block — shop/area/district/status for quick at-a-glance context
+      const profileBlock = `
+        <div class="card" style="margin-bottom:1rem;">
+          <h2>Agent Profile</h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem 1.25rem;font-size:0.9rem;">
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Agent ID</div><div><code>${DASH.escapeHtml(p.agent_id || a.agent_id)}</code></div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Shop</div><div>${DASH.escapeHtml(headerShop)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Area</div><div>${DASH.escapeHtml(headerArea)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">District</div><div>${DASH.escapeHtml(headerDist)}</div></div>
+            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Status</div><div><span class="pill">${DASH.escapeHtml(p.status || a.status || '—')}</span></div></div>
+          </div>
+        </div>
+      `;
+
       main.innerHTML = `
-        <h1 class="section-title">Agent View <small>${DASH.escapeHtml(a.shop_name)} · ${DASH.escapeHtml(a.area)}, ${DASH.escapeHtml(a.district)}</small></h1>
+        <h1 class="section-title">Agent View <small>${DASH.escapeHtml(headerShop)} · ${DASH.escapeHtml(headerArea)}, ${DASH.escapeHtml(headerDist)}</small></h1>
+        ${profileBlock}
         <div class="grid cols-4">${balanceCards}</div>
         <div class="grid cols-2" style="margin-top:1rem;">
           <div class="card">
@@ -121,9 +197,15 @@
   }
 
   document.getElementById('refresh-btn').addEventListener('click', render);
+  document.getElementById('reset-sim-btn').addEventListener('click', () => {
+    liveCash.reset();
+    liveWallet.reset();
+    DASH.toast('Sim reset — all ledgers back to starting balances', 'success');
+    render();
+  });
   render();
-  // Auto-refresh every 30 seconds
-  setInterval(render, 30000);
+  // Poll every 5s — fast enough to feel live, cheap enough for the demo.
+  setInterval(render, 5000);
 </script>
 </body>
 </html>

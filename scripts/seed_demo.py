@@ -1,7 +1,19 @@
 """Deterministic demo data seeder for Super Agent Intelligence.
 
-Run: python scripts/seed_demo.py
-Idempotent: clears existing domain data before inserting.
+Reads base_dataset.json as the canonical reference (the same JSON the login
+endpoint authenticates against), then mirrors it into Postgres so that:
+
+  - Agent.agent_id    ==  base_dataset.agent[i].agent_id   (e.g. "agent1", "agent1000")
+  - TerritoryOffice.id == base_dataset.territory-officer[i].id
+  - RiskAnalyst.id    == base_dataset.risk-analyst[i].id
+
+After loading the reference rows it synthesizes:
+  - E-money wallets per (agent, assigned-provider)
+  - Live "Eid-eve" transactions (last 30 min) tagged tx_day='Eid-eve'
+  - A handful of demo alerts/tickets/audit logs for the dashboards
+
+Run:  python scripts/seed_demo.py
+Idempotent: wipes existing domain data before inserting.
 """
 from __future__ import annotations
 
@@ -44,41 +56,9 @@ from app.models import (
 SEED = 20260711
 BD_TZ = timezone(timedelta(hours=6))
 
-
-# ---------------- Reference data ----------------
-
-DIVISIONS = [
-    ("dhaka", "Dhaka"),
-    ("chattogram", "Chattogram"),
-    ("sylhet", "Sylhet"),
-    ("khulna", "Khulna"),
-    ("rajshahi", "Rajshahi"),
-    ("barishal", "Barishal"),
-    ("rangpur", "Rangpur"),
-    ("mymensingh", "Mymensingh"),
-]
-
-AREAS_BY_DIV = {
-    "sylhet": ["Zindabazar", "Bondor", "Akhalia", "Subhanighat"],
-    "dhaka": ["Mirpur", "Uttara", "Dhanmondi", "Old Dhaka"],
-    "chattogram": ["Agrabad", "Khulshi", "Patiya"],
-    "khulna": ["Khalishpur", "Sonadanga"],
-    "rajshahi": ["Shaheb Bazar", "Talaimari"],
-    "barishal": ["Sadar Road"],
-    "rangpur": ["Central", "Pairabandh"],
-    "mymensingh": ["Ganginarpar", "Krishna Nagar"],
-}
-
-ANALYST_NAMES = [
-    "Rahim Ahmed", "Karim Hossain", "Jamal Uddin", "Farhan Chowdhury",
-    "Imran Khan", "Selim Reza", "Tariq Aziz", "Nadim Hassan",
-    "Saiful Islam", "Mahmud Rahman", "Asif Iqbal", "Rashed Khan",
-    "Noman Sheikh", "Babul Mia", "Shafiqul Islam", "Kamrul Hasan",
-    "Jasim Uddin", "Mamunur Rashid", "Tuhin Ahmed", "Shahin Alam",
-    "Ripon Mia", "Helal Uddin", "Anwar Hossain", "Badiuzzaman",
-]
-
-OFFICE_PREFIXES = ["North", "South", "East", "West", "Central"]
+# Map JSON's "bkash"/"nagad"/"rocket" provider ids to DB numeric ids (1/2/3)
+JSON_TO_DB_PROVIDER = {"bkash": "1", "nagad": "2", "rocket": "3"}
+DB_TO_JSON_PROVIDER = {v: k for k, v in JSON_TO_DB_PROVIDER.items()}
 
 
 def hash_customer(prefix: str, idx: int) -> str:
@@ -101,11 +81,27 @@ def fmt_bdt(amount: Decimal | float | int) -> str:
     return f"৳{','.join(groups)}.{last3}"
 
 
+def load_base_dataset() -> dict:
+    """Load base_dataset.json (the canonical login reference)."""
+    path = Path(__file__).resolve().parent.parent / "base_dataset.json"
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 # ---------------- Seeder ----------------
 
 def seed():
     create_all_tables()
     rng = random.Random(SEED)
+
+    # Load the canonical JSON so DB ids match the login registry.
+    dataset = load_base_dataset()
+    json_agents = dataset.get("agent", [])
+    json_officers = dataset.get("territory-officer", [])
+    json_analysts = dataset.get("risk-analyst", [])
+    json_assignments = dataset.get("agent-provider-assignment", [])
+    json_transactions = dataset.get("transactions-stream", [])
+    json_divisions = dataset.get("divisions", [])
 
     with Session(engine) as s:
         # Wipe all demo data first for idempotency
@@ -122,7 +118,7 @@ def seed():
         s.exec(delete(Provider))
         s.commit()
 
-        # 0. Providers (must come before any FK references)
+        # 0. Providers — DB numeric ids 1/2/3, mapped from JSON "bkash"/"nagad"/"rocket"
         s.add_all([
             Provider(id="1", provider_name="bKash"),
             Provider(id="2", provider_name="Nagad"),
@@ -130,104 +126,93 @@ def seed():
         ])
         s.commit()
 
-        # 1. Divisions
-        div_records = [Division(div_id=did, div_name=name) for did, name in DIVISIONS]
-        s.add_all(div_records)
-
-        # 2. Risk analysts: 3 per division = 24
-        analyst_records = []
-        for did, dname in DIVISIONS:
-            for prov in ("bkash", "nagad", "rocket"):
-                name = rng.choice(ANALYST_NAMES)
-                username = f"analyst.{prov[:3]}.{did[:3]}"
-                analyst_records.append(
-                    RiskAnalyst(
-                        id=f"analyst_{prov}_{did}",
-                        name=name,
-                        provider_id={"bkash": "1", "nagad": "2", "rocket": "3"}[prov],
-                        div_id=did,
-                        area_name=rng.choice(AREAS_BY_DIV[did]),
-                        username=username,
-                        password="123456",
-                    )
-                )
-        s.add_all(analyst_records)
-
-        # 3. Territory offices: 2 per (provider, division) = 48
-        office_records = []
-        for did, dname in DIVISIONS:
-            for prov in ("bkash", "nagad", "rocket"):
-                prov_id = {"bkash": "1", "nagad": "2", "rocket": "3"}[prov]
-                for i in range(2):
-                    username = f"officer.{prov[:3]}.{did[:3]}.{i+1}"
-                    office_records.append(
-                        TerritoryOffice(
-                            id=f"office_{prov}_{did}_{i+1}",
-                            name=f"{rng.choice(OFFICE_PREFIXES)} {AREAS_BY_DIV[did][i % len(AREAS_BY_DIV[did])]} ({prov.title()})",
-                            provider_id=prov_id,
-                            div_id=did,
-                            area_name=AREAS_BY_DIV[did][i % len(AREAS_BY_DIV[did])],
-                            risk_analyst_id=f"analyst_{prov}_{did}",
-                            username=username,
-                            password="123456",
-                        )
-                    )
-        s.add_all(office_records)
+        # 1. Divisions — from JSON
+        s.add_all([
+            Division(div_id=d["div_id"], div_name=d["div_name"])
+            for d in json_divisions
+        ])
         s.commit()
 
-        # 4. Agents: 6 per office = 288 agents (smaller for demo speed)
-        agent_records = []
-        assignment_records = []
-        wallet_records = []
-        for office in office_records:
-            # Derive the division id from the office id (format: office_<prov>_<div>_<n>)
-            parts = office.id.split("_")
-            office_div = parts[2]
-            for i in range(6):
-                agent_id = f"agent_{parts[1]}_{parts[2]}_{parts[3]}_{i+1:02d}"
-                username = f"agent.{parts[1][:3]}.{parts[2][:3]}.{parts[3]}.{i+1:02d}"
-                # Realistic band per provider: bKash larger, Rocket smaller
-                if office.provider_id == "1":
-                    cash = rng.randint(100_000, 250_000)
-                elif office.provider_id == "2":
-                    cash = rng.randint(80_000, 180_000)
-                else:
-                    cash = rng.randint(60_000, 140_000)
-                agent_records.append(
-                    Agent(
-                        agent_id=agent_id,
-                        shop_name=f"{office.area_name} {rng.choice(['Store', 'Point', 'Center', 'Cash Point'])} #{rng.randint(1,999)}",
-                        area=office.area_name,
-                        district=office_div,
-                        shared_physical_cash=Decimal(cash),
-                        status=AgentStatus.ACTIVE,
-                        username=username,
-                        password="123456",
-                    )
-                )
-                assignment_records.append(
-                    AgentProviderAssignment(
-                        agent_id=agent_id,
-                        provider_id=office.provider_id,
-                        to_officer_id=office.id,
-                    )
-                )
-        s.add_all(agent_records)
-        s.add_all(assignment_records)
+        # 2. Risk analysts — canonical JSON ids, login matches by name.
+        #    JSON doesn't carry area_name for analysts; derive it from the first
+        #    territory office under that analyst (or fall back to the division name).
+        officer_area_by_analyst = {}
+        for o in json_officers:
+            officer_area_by_analyst.setdefault(o["risk_analyst_id"], o["area_name"])
+        div_name_by_id = {d["div_id"]: d["div_name"] for d in json_divisions}
 
-        # 5. Wallets: per (agent, assigned provider) — realistic bands
-        for asg in assignment_records:
-            if asg.provider_id == "1":
-                bal = rng.randint(150_000, 450_000)
-            elif asg.provider_id == "2":
-                bal = rng.randint(80_000, 250_000)
+        s.add_all([
+            RiskAnalyst(
+                id=a["id"],                              # "1".."9" — matches login
+                name=a["name"],                          # "risk1".."risk9"
+                provider_id=JSON_TO_DB_PROVIDER[a["provider_id"]],
+                div_id=a["div_id"],
+                area_name=officer_area_by_analyst.get(a["id"]) or div_name_by_id.get(a["div_id"], a["div_id"]),
+                username=a["name"],                      # login matches by name
+                password="123456",
+            )
+            for a in json_analysts
+        ])
+        s.commit()
+
+        # 3. Territory offices — canonical JSON ids, login matches by name
+        s.add_all([
+            TerritoryOffice(
+                id=o["id"],                              # "1".."27"
+                name=o["name"],                          # "to1".."to27"
+                provider_id=JSON_TO_DB_PROVIDER[o["provider_id"]],
+                div_id=o["div_id"],
+                area_name=o["area_name"],
+                risk_analyst_id=o["risk_analyst_id"],
+                username=o["name"],                      # login matches by name
+                password="123456",
+            )
+            for o in json_officers
+        ])
+        s.commit()
+
+        # 4. Agents — canonical JSON ids (e.g. "agent1", "agent1000")
+        s.add_all([
+            Agent(
+                agent_id=a["agent_id"],                  # matches login exactly
+                shop_name=a["shop_name"],
+                area=a["area"],
+                district=a["district"],
+                shared_physical_cash=Decimal(a["shared_physical_cash"]),
+                status=AgentStatus(a["status"]),
+                username=a["agent_id"],                  # login matches by agent_id
+                password="123456",
+            )
+            for a in json_agents
+        ])
+
+        # 5. Agent-provider assignments — pulled directly from JSON
+        # (each agent serves 1..3 providers depending on entries)
+        s.add_all([
+            AgentProviderAssignment(
+                agent_id=a["agent-id"],
+                provider_id=JSON_TO_DB_PROVIDER[a["provider_id"]],
+                to_officer_id=a["to-officer-id"],
+            )
+            for a in json_assignments
+        ])
+        s.commit()
+
+        # 6. Wallets — one per (agent, assigned-provider), realistic balance bands
+        wallet_records = []
+        for asg in json_assignments:
+            db_prov = JSON_TO_DB_PROVIDER[asg["provider_id"]]
+            if db_prov == "1":
+                bal = rng.randint(150_000, 450_000)  # bKash — bigger
+            elif db_prov == "2":
+                bal = rng.randint(80_000, 250_000)   # Nagad — mid
             else:
-                bal = rng.randint(40_000, 150_000)
+                bal = rng.randint(40_000, 150_000)   # Rocket — smaller
             wallet_records.append(
                 ProviderWallet(
-                    wallet_id=f"wallet_{asg.agent_id}_{asg.provider_id}",
-                    agent_id=asg.agent_id,
-                    provider_id=asg.provider_id,
+                    wallet_id=f"wallet_{asg['agent-id']}_{db_prov}",
+                    agent_id=asg["agent-id"],
+                    provider_id=db_prov,
                     e_money_balance=Decimal(bal),
                     last_sync_time=datetime.now(BD_TZ) - timedelta(minutes=rng.randint(1, 30)),
                 )
@@ -235,43 +220,79 @@ def seed():
         s.add_all(wallet_records)
         s.commit()
 
-        # 6. Recent transactions for each wallet — 6 hours of history
-        tx_records = []
+        # 7. Historical transactions — load directly from JSON's transactions-stream,
+        #    marking them as "Normal-Day" (older baseline) and re-stamping the timestamps
+        #    so they're ~2 weeks old (consistent with the JSON's June 11 dates).
+        #    Skip any malformed rows (e.g. placeholder entries that lack amount/tx_type).
+        def _cust_hash(t: dict, idx: int) -> str:
+            return t.get("customer_id_hash") or hash_customer(t.get("provider_id", "unk"), idx)
+
+        json_tx_records = []
+        skipped_json_tx = 0
+        for idx, t in enumerate(json_transactions):
+            if not all(k in t for k in ("tx_id", "agent_id", "provider_id", "timestamp", "tx_type", "amount")):
+                skipped_json_tx += 1
+                continue
+            try:
+                json_tx_records.append(
+                    TransactionStream(
+                        tx_id=t["tx_id"],
+                        agent_id=t["agent_id"],
+                        provider_id=JSON_TO_DB_PROVIDER[t["provider_id"]],
+                        customer_id_hash=_cust_hash(t, idx),
+                        tx_type=TransactionType(t["tx_type"]),
+                        tx_day="Normal-Day",                # baseline (historical)
+                        amount=Decimal(t["amount"]),
+                        timestamp=datetime.fromisoformat(t["timestamp"]).replace(tzinfo=BD_TZ).astimezone(BD_TZ).replace(tzinfo=None),
+                    )
+                )
+            except (KeyError, ValueError):
+                skipped_json_tx += 1
+        if skipped_json_tx:
+            print(f"  (skipped {skipped_json_tx} malformed JSON transaction rows)")
+
+        # 8. LIVE "Eid-eve" transactions — synthesized for the LAST 30 MINUTES.
+        #    These are what the simulation engine and the dashboard "Live outflow/inflow"
+        #    velocity read. Higher amounts, higher frequency (Eid-eve surge).
         now = datetime.now(BD_TZ)
+        live_tx_records = []
         for wallet in wallet_records:
-            for mins_ago in range(360, 0, -2):
-                if rng.random() < 0.55:  # ~55% chance of a transaction every 2 min
+            for mins_ago in range(30, 0, -1):
+                if rng.random() < 0.65:  # ~65% chance per minute — denser than baseline
                     ttype = rng.choices(
                         [TransactionType.CASH_IN, TransactionType.CASH_OUT],
-                        weights=[0.45, 0.55],
+                        weights=[0.40, 0.60],  # more cash-out on Eid-eve
                     )[0]
                     if ttype == TransactionType.CASH_OUT:
-                        amount = rng.randint(500, 12_000)
+                        amount = rng.randint(3_000, 18_000)  # bigger than baseline
                     else:
-                        amount = rng.randint(200, 8_000)
-                    tx_records.append(
+                        amount = rng.randint(2_000, 12_000)
+                    live_tx_records.append(
                         TransactionStream(
-                            tx_id=f"tx_{wallet.wallet_id}_{mins_ago}",
+                            tx_id=f"live_{wallet.wallet_id}_{mins_ago}",
                             agent_id=wallet.agent_id,
                             provider_id=wallet.provider_id,
                             customer_id_hash=hash_customer(wallet.provider_id, rng.randint(1, 800)),
                             tx_type=ttype,
+                            tx_day="Eid-eve",                 # live stream
                             amount=Decimal(amount),
                             timestamp=now - timedelta(minutes=mins_ago),
                         )
                     )
-        s.add_all(tx_records)
+
+        s.add_all(json_tx_records)
+        s.add_all(live_tx_records)
         s.commit()
 
-        # 7. A handful of pre-seeded alerts + tickets + audit logs to demonstrate the dashboards
+        # 9. Demo alerts + tickets + audit logs — one per assignment so the dashboards
+        #    have populated data to render after login.
         demo_alerts = []
         demo_tickets = []
         demo_audit = []
-        sample_assignments = assignment_records[:30]  # take first 30 assignments
-        for idx, asg in enumerate(sample_assignments):
-            agent_id = asg.agent_id
-            provider_id = asg.provider_id
-            officer_id = asg.to_officer_id
+        for idx, asg in enumerate(json_assignments):
+            agent_id = asg["agent-id"]
+            provider_id = JSON_TO_DB_PROVIDER[asg["provider_id"]]
+            officer_id = asg["to-officer-id"]
 
             alert_id = f"alert_demo_{idx:03d}"
             ticket_id = f"ticket_demo_{idx:03d}"
@@ -334,7 +355,7 @@ def seed():
                 )
             )
 
-            # 70% OPEN, 20% ACKNOWLEDGED, 10% UNDER_REVIEW (none RESOLVED — keeps officer dashboard populated)
+            # 70% OPEN, 20% ACKNOWLEDGED, 10% UNDER_REVIEW (none RESOLVED — keeps dashboards populated)
             status_roll = rng.random()
             if status_roll < 0.7:
                 status = TicketStatus.OPEN
@@ -378,29 +399,26 @@ def seed():
         s.commit()
 
         # Summary
-        print(f"[seed] OK")
+        print(f"[seed] OK (canonical ids from base_dataset.json)")
         print(f"  Divisions:        {len(s.exec(select(Division)).all())}")
         print(f"  Risk Analysts:    {len(s.exec(select(RiskAnalyst)).all())}")
         print(f"  Territory Offices:{len(s.exec(select(TerritoryOffice)).all())}")
         print(f"  Agents:           {len(s.exec(select(Agent)).all())}")
         print(f"  Assignments:      {len(s.exec(select(AgentProviderAssignment)).all())}")
         print(f"  Wallets:          {len(s.exec(select(ProviderWallet)).all())}")
-        print(f"  Transactions:     {len(s.exec(select(TransactionStream)).all())}")
+        print(f"  Transactions:     {len(s.exec(select(TransactionStream)).all())}  "
+              f"(JSON baseline + live Eid-eve)")
         print(f"  Alerts:           {len(s.exec(select(Alert)).all())}")
         print(f"  Tickets:          {len(s.exec(select(Ticket)).all())}")
         print(f"  Audit logs:       {len(s.exec(select(AuditLog)).all())}")
 
-        print("\n[seed] Demo credentials (all passwords are '123456'):")
-        # First analyst, first officer, first agent from each provider
-        sample_analyst = s.exec(select(RiskAnalyst).limit(1)).first()
-        sample_officer = s.exec(select(TerritoryOffice).limit(1)).first()
-        sample_agents = s.exec(select(Agent).limit(3)).all()
-        if sample_analyst:
-            print(f"  Risk Analyst:    username={sample_analyst.username}  password=123456")
-        if sample_officer:
-            print(f"  Territory Office:username={sample_officer.username}  password=123456")
-        for sa in sample_agents:
-            print(f"  Agent:           username={sa.username}  password=123456")
+        print("\n[seed] Login handle examples (password is always '123456'):")
+        for a in json_agents[:3]:
+            print(f"  Agent:        username='{a['agent_id']}'   shop={a['shop_name']}")
+        for o in json_officers[:3]:
+            print(f"  Officer:      username='{o['name']}'       area={o['area_name']} ({DB_TO_JSON_PROVIDER.get(o['provider_id'], o['provider_id'])})")
+        for an in json_analysts[:3]:
+            print(f"  Risk Analyst: username='{an['name']}'      div={an['div_id']}")
 
 
 if __name__ == "__main__":

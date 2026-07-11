@@ -23,7 +23,7 @@
       border-radius: 16px;
       padding: 2.5rem 2rem;
       width: 100%;
-      max-width: 420px;
+      max-width: 440px;
       box-shadow: 0 20px 60px rgba(0,0,0,0.5);
     }
     .brand {
@@ -49,9 +49,7 @@
       color: #94a3b8;
       font-size: 0.85rem;
     }
-    .field {
-      margin-bottom: 1rem;
-    }
+    .field { margin-bottom: 1rem; }
     .field label {
       display: block;
       font-size: 0.78rem;
@@ -92,10 +90,7 @@
       box-shadow: 0 8px 24px rgba(56, 189, 248, 0.3);
     }
     .submit-btn:active:not(:disabled) { transform: translateY(1px); }
-    .submit-btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
+    .submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .error {
       background: #7f1d1d;
       border: 1px solid #ef4444;
@@ -114,7 +109,7 @@
       color: #94a3b8;
       font-size: 0.78rem;
       text-align: center;
-      line-height: 1.5;
+      line-height: 1.6;
     }
     .hint code {
       background: #1e293b;
@@ -157,7 +152,8 @@
 
       <div class="field">
         <label for="username">Username</label>
-        <input id="username" type="text" placeholder="e.g. agent.bka.dha.1.01" required />
+        <input id="username" type="text" placeholder="Select a role first" required />
+        <small id="username-hint" style="color:#64748b;font-size:0.75rem;display:block;margin-top:0.3rem;"></small>
       </div>
 
       <div class="field">
@@ -169,16 +165,55 @@
       <div id="error" class="error"></div>
     </form>
 
-    <div class="hint">
-      Demo credentials (all passwords: <code>123456</code>)<br>
-      Agent: <code>agent.bka.dha.1.01</code> · Officer: <code>officer.bka.dha.1</code> · Analyst: <code>analyst.bka.dha</code>
+    <div class="hint" id="hint-block">
+      Loading demo credentials…
     </div>
   </div>
 
 <script>
+  const roleSelect = document.getElementById('role');
+  const usernameInput = document.getElementById('username');
+  const usernameHint = document.getElementById('username-hint');
+  const hintBlock = document.getElementById('hint-block');
   const form = document.getElementById('login-form');
   const errorBox = document.getElementById('error');
   const submitBtn = document.getElementById('submit-btn');
+
+  const ROLE_HINTS = {
+    agent:   { placeholder: 'e.g. agent1', desc: 'Type the agent_id from the JSON registry' },
+    officer: { placeholder: 'e.g. to1',    desc: 'Type the territory officer name (e.g. to1)' },
+    analyst: { placeholder: 'e.g. risk1',  desc: 'Type the risk analyst name (e.g. risk1)' },
+  };
+
+  const SAMPLES = {};
+
+  // Load sample credentials from server
+  fetch('/api/login/sample-credentials')
+    .then(r => r.json())
+    .then(s => {
+      Object.assign(SAMPLES, s);
+      hintBlock.innerHTML = `
+        Demo credentials (password: <code>123456</code> for all)<br>
+        Agent: <code>${s.agent ?? '—'}</code> ·
+        Officer: <code>${s.officer ?? '—'}</code> ·
+        Analyst: <code>${s.analyst ?? '—'}</code>
+      `;
+    })
+    .catch(() => {
+      hintBlock.innerHTML = 'Could not load sample credentials.';
+    });
+
+  roleSelect.addEventListener('change', () => {
+    const role = roleSelect.value;
+    const h = ROLE_HINTS[role];
+    if (h) {
+      usernameInput.placeholder = h.placeholder;
+      usernameHint.textContent = h.desc;
+    } else {
+      usernameInput.placeholder = 'Select a role first';
+      usernameHint.textContent = '';
+    }
+  });
 
   function showError(msg) {
     errorBox.textContent = msg;
@@ -189,8 +224,8 @@
     e.preventDefault();
     errorBox.classList.remove('show');
 
-    const role = document.getElementById('role').value;
-    const username = document.getElementById('username').value.trim();
+    const role = roleSelect.value;
+    const username = usernameInput.value.trim();
     const password = document.getElementById('password').value;
 
     if (!role) return showError('Please select a role.');
@@ -210,7 +245,13 @@
       if (!res.ok) {
         throw new Error(data.detail || `Login failed (HTTP ${res.status})`);
       }
-      // Success: redirect to role-specific dashboard
+      // Stash profile for the dashboard to pick up
+      sessionStorage.setItem('login_profile', JSON.stringify({
+        role: data.role,
+        user_id: data.user_id,
+        display_name: data.display_name,
+        profile: data.profile,
+      }));
       window.location.href = data.redirect;
     } catch (err) {
       showError(err.message);
