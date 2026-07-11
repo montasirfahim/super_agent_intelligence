@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Risk Analyst Dashboard — Super Agent Intelligence</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>Super Agent Intelligence</span>
+      <span class="role-tag">RISK ANALYST</span>
+    </div>
+    <div class="user-tag">
+      <span>Analyst:</span>
+      <span class="name" id="analyst-name">—</span>
+      <span class="pill" id="provider-pill">—</span>
+    </div>
+    <div class="actions">
+      <button id="refresh-btn">↻ Refresh</button>
+      <a href="/">Sign out</a>
+    </div>
+  </header>
+  <main id="content">
+    <div class="empty">Loading…</div>
+  </main>
+
+<script src="/static/dashboard.js"></script>
+<script>
+  async function render() {
+    const main = document.getElementById('content');
+    main.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const data = await DASH.api('GET', '/api/dashboard/analyst');
+      const an = data.analyst;
+      document.getElementById('analyst-name').textContent = an.name;
+      document.getElementById('provider-pill').textContent = `${an.provider} · ${an.division}`;
+
+      const f = data.funnel;
+      const tickets = data.tickets;
+      const ticketRows = tickets.map(t => `
+        <tr>
+          <td><code>${t.ticket_id.slice(-6)}</code></td>
+          <td>${DASH.escapeHtml(t.shop_name)}<br><small class="sub">${DASH.escapeHtml(t.area)}</small></td>
+          <td><span class="badge sev-${t.severity}">${t.severity}</span></td>
+          <td>${t.alert_type.replace('_', ' ')}</td>
+          <td>C=${t.confidence_score.toFixed(3)}</td>
+          <td>${t.provider}</td>
+          <td><span class="badge st-${t.status}">${t.status}</span></td>
+          <td>
+            <div class="actions">
+              <button data-ticket="${t.ticket_id}" data-action="view-evidence" class="primary">Evidence</button>
+              ${t.status === 'UNDER_REVIEW' ? `
+                <button data-ticket="${t.ticket_id}" data-action="confirm" class="success">Confirm Real</button>
+                <button data-ticket="${t.ticket_id}" data-action="false-positive">False +</button>
+              ` : ''}
+            </div>
+          </td>
+        </tr>
+      `).join('');
+
+      main.innerHTML = `
+        <h1 class="section-title">Risk Analyst <small>${DASH.escapeHtml(an.name)} · ${DASH.escapeHtml(an.provider)} · ${DASH.escapeHtml(an.division)}</small></h1>
+
+        <div class="grid cols-4" style="margin-bottom:1rem;">
+          <div class="card"><div class="metric"><div class="v">${data.office_count}</div><div class="l">Offices Under Review</div></div></div>
+          <div class="card"><div class="metric"><div class="v">${data.total_tickets}</div><div class="l">Total Tickets</div></div></div>
+          <div class="card"><div class="metric"><div class="v">${data.avg_confidence.toFixed(3)}</div><div class="l">Avg C<sub>risk</sub></div></div></div>
+          <div class="card"><div class="metric"><div class="v">${f.UNDER_REVIEW}</div><div class="l">Awaiting Verdict</div></div></div>
+        </div>
+
+        <div class="card" style="margin-bottom:1rem;">
+          <h2>Escalation Funnel</h2>
+          <div class="funnel">
+            <div class="col OPEN"><div class="v">${f.OPEN}</div><div class="l">Open</div></div>
+            <div class="col ACKNOWLEDGED"><div class="v">${f.ACKNOWLEDGED}</div><div class="l">Acknowledged</div></div>
+            <div class="col UNDER_REVIEW"><div class="v">${f.UNDER_REVIEW}</div><div class="l">Under Review</div></div>
+            <div class="col RESOLVED"><div class="v">${f.RESOLVED}</div><div class="l">Resolved</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Escalated Tickets <small style="color:var(--text-dim);font-weight:400;">${tickets.length}</small></h2>
+          ${tickets.length === 0
+            ? `<div class="empty">No tickets escalated to you yet.</div>`
+            : `<table>
+                <thead><tr>
+                  <th>ID</th><th>Agent Shop</th><th>Sev</th><th>Type</th><th>C<sub>risk</sub></th>
+                  <th>Provider</th><th>Status</th><th>Verdict</th>
+                </tr></thead>
+                <tbody>${ticketRows}</tbody>
+              </table>`}
+        </div>
+      `;
+    } catch (e) {
+      main.innerHTML = `<div class="error-banner">Error: ${DASH.escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const ticketId = btn.dataset.ticket;
+    const action = btn.dataset.action;
+    try {
+      if (action === 'view-evidence') {
+        DASH.openEvidence(ticketId, 'analyst');
+      } else if (action === 'confirm') {
+        await DASH.api('POST', `/api/tickets/${ticketId}/confirm-anomaly`);
+        DASH.toast('Confirmed as REAL operational pattern', 'success');
+        render();
+      } else if (action === 'false-positive') {
+        await DASH.api('POST', `/api/tickets/${ticketId}/mark-false-positive`);
+        DASH.toast('Marked as false positive', 'success');
+        render();
+      }
+    } catch (err) {
+      DASH.toast(err.message, 'error');
+    }
+  });
+
+  document.getElementById('refresh-btn').addEventListener('click', render);
+  render();
+  setInterval(render, 30000);
+</script>
+</body>
+</html>

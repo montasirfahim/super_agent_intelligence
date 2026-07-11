@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Territory Officer Dashboard — Super Agent Intelligence</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>Super Agent Intelligence</span>
+      <span class="role-tag">TERRITORY OFFICER</span>
+    </div>
+    <div class="user-tag">
+      <span>Office:</span>
+      <span class="name" id="office-name">—</span>
+      <span class="pill" id="provider-pill">—</span>
+    </div>
+    <div class="actions">
+      <button id="refresh-btn">↻ Refresh</button>
+      <a href="/">Sign out</a>
+    </div>
+  </header>
+  <main id="content">
+    <div class="empty">Loading…</div>
+  </main>
+
+<script src="/static/dashboard.js"></script>
+<script>
+  async function render() {
+    const main = document.getElementById('content');
+    main.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const data = await DASH.api('GET', '/api/dashboard/officer');
+      document.getElementById('office-name').textContent = data.office.name;
+      document.getElementById('provider-pill').textContent = data.office.provider + ' ONLY';
+
+      const o = data.office;
+      const tickets = data.tickets;
+      const ticketRows = tickets.map(t => `
+        <tr>
+          <td><code>${t.ticket_id.slice(-6)}</code></td>
+          <td><code>${t.agent_id.slice(-8)}</code></td>
+          <td><span class="badge sev-${t.severity}">${t.severity}</span></td>
+          <td>${t.alert_type.replace('_', ' ')}</td>
+          <td class="bangla" style="max-width:280px;">${DASH.escapeHtml(t.message_bn.slice(0, 60))}${t.message_bn.length > 60 ? '…' : ''}</td>
+          <td>${t.created_at.slice(11)}</td>
+          <td><span class="badge st-${t.status}">${t.status}</span></td>
+          <td>
+            <div class="actions">
+              <button data-ticket="${t.ticket_id}" data-action="view-evidence" class="primary">View</button>
+              ${t.status === 'OPEN' ? `<button data-ticket="${t.ticket_id}" data-action="ack">Ack</button>` : ''}
+              ${t.status === 'OPEN' || t.status === 'ACKNOWLEDGED' ? `<button data-ticket="${t.ticket_id}" data-action="escalate" class="danger">Escalate</button>` : ''}
+              <button data-ticket="${t.ticket_id}" data-action="note">+ Note</button>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+
+      main.innerHTML = `
+        <h1 class="section-title">Territory Officer <small>${DASH.escapeHtml(o.name)} · ${DASH.escapeHtml(o.provider)}</small></h1>
+
+        <div class="grid cols-4" style="margin-bottom:1rem;">
+          <div class="card"><div class="metric"><div class="v">${data.agent_count}</div><div class="l">Assigned Agents</div></div></div>
+          <div class="card"><div class="metric"><div class="v" style="color:var(--red);">${data.open_count}</div><div class="l">Open Tickets</div></div></div>
+          <div class="card"><div class="metric"><div class="v" style="color:var(--green);">${data.resolved_count}</div><div class="l">Resolved</div></div></div>
+          <div class="card"><div class="metric"><div class="v">${data.mtta_minutes !== null ? data.mtta_minutes + ' min' : '—'}</div><div class="l">MTTA</div></div></div>
+        </div>
+
+        <div class="card">
+          <h2>Case Management — ${o.provider} Tickets Only <small style="color:var(--text-dim);font-weight:400;">${tickets.length} total</small></h2>
+          ${tickets.length === 0
+            ? `<div class="empty">No active tickets in your office.</div>`
+            : `<table>
+                <thead><tr>
+                  <th>ID</th><th>Agent</th><th>Sev</th><th>Type</th><th>Bangla Summary</th>
+                  <th>Created</th><th>Status</th><th>Actions</th>
+                </tr></thead>
+                <tbody>${ticketRows}</tbody>
+              </table>`}
+        </div>
+      `;
+    } catch (e) {
+      main.innerHTML = `<div class="error-banner">Error: ${DASH.escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  // Action handlers (scoped to this page)
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const ticketId = btn.dataset.ticket;
+    const action = btn.dataset.action;
+    try {
+      if (action === 'view-evidence') {
+        DASH.openEvidence(ticketId, 'officer');
+      } else if (action === 'ack') {
+        await DASH.api('POST', `/api/tickets/${ticketId}/acknowledge`);
+        DASH.toast('Ticket acknowledged', 'success');
+        render();
+      } else if (action === 'escalate') {
+        await DASH.api('POST', `/api/tickets/${ticketId}/escalate`);
+        DASH.toast('Escalated to analyst', 'success');
+        render();
+      } else if (action === 'note') {
+        DASH.openNoteModal(ticketId, render);
+      }
+    } catch (err) {
+      DASH.toast(err.message, 'error');
+    }
+  });
+
+  document.getElementById('refresh-btn').addEventListener('click', render);
+  render();
+  setInterval(render, 30000);
+</script>
+</body>
+</html>

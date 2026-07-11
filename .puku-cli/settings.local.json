@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(curl -s \"http://127.0.0.1:8004/api/dashboard/officer?role=officer&user_id=office_nagad_dhaka_1\")",
+      "Bash(curl -s -o /dev/null -w \"GET /          HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/)",
+      "Bash(curl -s -o /dev/null -w \"GET /agent-dash HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/agent-dash)",
+      "Bash(curl -s -o /dev/null -w \"GET /to-dash    HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/to-dash)",
+      "Bash(curl -s -o /dev/null -w \"GET /risk-dash  HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/risk-dash)",
+      "Bash(curl -s -o /dev/null -w \"GET /static/dashboard.css HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/static/dashboard.css)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \"8000\\\\|8001\\\\|8002\\\\|8003\\\\|8004\")",
+      "Bash(curl -s -o /dev/null -w \"GET /static/dashboard.js  HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/static/dashboard.js)",
+      "Bash(curl -s -X POST -H \"Content-Type: application/json\" -d '{\"\"\"\"role\"\"\"\":\"\"\"\"officer\"\"\"\",\"\"\"\"username\"\"\"\":\"\"\"\"officer.bka.dha.1\"\"\"\",\"\"\"\"password\"\"\"\":\"\"\"\"123456\"\"\"\"}' http://127.0.0.1:8000/api/login)",
+      "Bash(curl -s -X POST -H \"Content-Type: application/json\" -d '{\"\"\"\"role\"\"\"\":\"\"\"\"analyst\"\"\"\",\"\"\"\"username\"\"\"\":\"\"\"\"analyst.bka.dha\"\"\"\",\"\"\"\"password\"\"\"\":\"\"\"\"123456\"\"\"\"}' http://127.0.0.1:8000/api/login)",
+      "Bash(curl -s -X POST -H \"Content-Type: application/json\" -d '{\"\"\"\"role\"\"\"\":\"\"\"\"agent\"\"\"\",\"\"\"\"username\"\"\"\":\"\"\"\"agent.bka.dha.1.01\"\"\"\",\"\"\"\"password\"\"\"\":\"\"\"\"wrong\"\"\"\"}' http://127.0.0.1:8000/api/login)"
+    ]
+  }
+}

@@ -76,6 +76,8 @@ class RiskAnalyst(SQLModel, table=True):
     provider_id: str = Field(foreign_key="provider.id")
     div_id: str = Field(foreign_key="division.div_id")
     area_name: str
+    username: Optional[str] = Field(default=None, index=True)
+    password: Optional[str] = Field(default=None)
 
     provider: Optional[Provider] = Relationship(back_populates="risk_analysts")
     division: Optional[Division] = Relationship(back_populates="risk_analysts")
@@ -89,6 +91,8 @@ class TerritoryOffice(SQLModel, table=True):
     div_id: str = Field(foreign_key="division.div_id")
     area_name: str
     risk_analyst_id: str = Field(foreign_key="riskanalyst.id")
+    username: Optional[str] = Field(default=None, index=True)
+    password: Optional[str] = Field(default=None)
 
     provider: Optional[Provider] = Relationship(back_populates="territory_offices")
     division: Optional[Division] = Relationship(back_populates="territory_offices")
@@ -104,6 +108,8 @@ class Agent(SQLModel, table=True):
     district: str
     shared_physical_cash: Decimal
     status: AgentStatus
+    username: Optional[str] = Field(default=None, index=True)
+    password: Optional[str] = Field(default=None)
 
     provider_assignments: List["AgentProviderAssignment"] = Relationship(back_populates="agent")
     wallets: List["ProviderWallet"] = Relationship(back_populates="agent")

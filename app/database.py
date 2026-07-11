@@ -1,7 +1,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlmodel import SQLModel
+from sqlmodel import Session as SQLModelSession, SQLModel
 from dotenv import load_dotenv
 
 # load .env file
@@ -42,7 +42,14 @@ if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Use SQLModel's Session so .exec(select(...)) works everywhere
+SessionLocal = sessionmaker(
+    class_=SQLModelSession,
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    expire_on_commit=False,
+)
 
 def create_all_tables():
     SQLModel.metadata.create_all(bind=engine)

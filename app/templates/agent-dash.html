@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Dashboard — Super Agent Intelligence</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>Super Agent Intelligence</span>
+      <span class="role-tag">AGENT</span>
+    </div>
+    <div class="user-tag">
+      <span>Shop:</span>
+      <span class="name" id="shop-name">—</span>
+    </div>
+    <div class="actions">
+      <button id="refresh-btn">↻ Refresh</button>
+      <a href="/">Sign out</a>
+    </div>
+  </header>
+  <main id="content">
+    <div class="empty">Loading…</div>
+  </main>
+
+<script src="/static/dashboard.js"></script>
+<script>
+  const fmtBDT = (n) => '৳' + Math.round(n).toLocaleString('en-IN');
+
+  async function render() {
+    const main = document.getElementById('content');
+    main.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const data = await DASH.api('GET', '/api/dashboard/agent');
+      const a = data.agent;
+      document.getElementById('shop-name').textContent = a.shop_name;
+
+      const phys = data.physical;
+      const sevClass = (s) => `sev-${s}`;
+      const providerClass = (id) => id === '1' ? 'bkash' : id === '2' ? 'nagad' : 'rocket';
+
+      const balanceCards = `
+        <div class="balance-card physical">
+          <div class="label">Shared Physical Cash Drawer</div>
+          <div class="amount">${DASH.escapeHtml(phys.balance_fmt)}</div>
+          <div class="meta">
+            <span>Outflow: ${fmtBDT(phys.outflow_velocity)}/min</span>
+            <span>Inflow: ${fmtBDT(phys.inflow_velocity)}/min</span>
+          </div>
+          <div class="runway">
+            <span>Runway: <strong>${phys.t_runaway_fmt}</strong></span>
+            <span class="badge ${sevClass(phys.severity)}">${phys.severity}</span>
+          </div>
+        </div>
+        ${data.wallets.map(w => `
+          <div class="balance-card ${providerClass(w.provider_id)}">
+            <div class="label">${w.provider_name} E-Money</div>
+            <div class="amount">${DASH.escapeHtml(w.balance_fmt)}</div>
+            <div class="meta">
+              <span>Last sync: ${w.last_sync_time}</span>
+              <span>${w.has_wallet ? '' : '<em>No wallet</em>'}</span>
+            </div>
+            ${w.has_wallet ? `
+              <div class="runway">
+                <span>Runway: <strong>${w.t_runaway_fmt}</strong></span>
+                <span class="badge ${sevClass(w.severity)}">${w.severity}</span>
+              </div>
+            ` : ''}
+          </div>
+        `).join('')}
+      `;
+
+      const txns = data.recent_transactions.map(t => `
+        <tr>
+          <td><code>${t.timestamp}</code></td>
+          <td>${t.provider}</td>
+          <td>${t.type.replace('_', '-')}</td>
+          <td style="text-align:right;font-variant-numeric:tabular-nums;">${t.amount_fmt}</td>
+          <td><code title="${t.customer_hash_short}">${t.customer_hash_short.slice(0, 10)}…</code></td>
+        </tr>
+      `).join('');
+
+      const alerts = data.alerts.length === 0
+        ? `<div class="empty">No active alerts. Operating normally.</div>`
+        : data.alerts.map(a => `
+            <div class="card" style="margin-bottom:0.6rem;">
+              <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
+                <div>
+                  <span class="badge sev-${a.severity}">${a.severity}</span>
+                  <span class="pill">${a.alert_type.replace('_', ' ')}</span>
+                  <span class="pill">C=${a.confidence_score.toFixed(3)}</span>
+                </div>
+                <small class="sub">${a.created_at}</small>
+              </div>
+              <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn)}</p>
+            </div>
+          `).join('');
+
+      main.innerHTML = `
+        <h1 class="section-title">Agent View <small>${DASH.escapeHtml(a.shop_name)} · ${DASH.escapeHtml(a.area)}, ${DASH.escapeHtml(a.district)}</small></h1>
+        <div class="grid cols-4">${balanceCards}</div>
+        <div class="grid cols-2" style="margin-top:1rem;">
+          <div class="card">
+            <h2>Recent Transactions <small style="color:var(--text-dim);font-weight:400;">Last 15</small></h2>
+            ${data.recent_transactions.length === 0
+              ? `<div class="empty">No recent transactions.</div>`
+              : `<table><thead><tr><th>Time</th><th>Provider</th><th>Type</th><th style="text-align:right;">Amount</th><th>Customer Hash</th></tr></thead><tbody>${txns}</tbody></table>`}
+          </div>
+          <div class="card">
+            <h2>Active Alerts <small style="color:var(--text-dim);font-weight:400;">${data.alerts.length}</small></h2>
+            ${alerts}
+          </div>
+        </div>
+      `;
+    } catch (e) {
+      main.innerHTML = `<div class="error-banner">Error: ${DASH.escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  document.getElementById('refresh-btn').addEventListener('click', render);
+  render();
+  // Auto-refresh every 30 seconds
+  setInterval(render, 30000);
+</script>
+</body>
+</html>
