@@ -8,23 +8,22 @@ def build_database_url(base_url: str, password: str | None) -> str:
     if not password:
         return base_url
 
-    prefix, _, suffix = base_url.partition("://")
-    if not suffix:
+    if "://" not in base_url:
         return base_url
 
-    credentials, separator, remainder = suffix.partition("@")
-    if not separator:
+    prefix, rest = base_url.split("://", 1)
+    if "@" not in rest:
         return base_url
 
-    userinfo = credentials.split(":", 1)
-    if len(userinfo) == 2 and userinfo[1]:
+    credentials, host_and_db = rest.split("@", 1)
+    if ":" in credentials:
         return base_url
 
-    return f"{prefix}://{userinfo[0]}:{password}@{remainder}"
+    return f"{prefix}://{credentials}:{password}@{host_and_db}"
 
 
 DATABASE_URL = build_database_url(
-    os.getenv("DATABASE_URL", "mysql+pymysql://root@localhost:3306/super_agent_intelligence"),
+    os.getenv("DATABASE_URL", "mysql+pymysql://root@localhost:3307/super_agent_intelligence"),
     os.getenv("DB_PASS"),
 )
 

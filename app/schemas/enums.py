@@ -1,19 +1,27 @@
 from enum import Enum
 
 
-class Provider(str, Enum):
+class LLMProvider(str, Enum):
     OPENAI = "openai"
     GROQ = "groq"
 
 
 class AlertStatus(str, Enum):
-    OPEN = "open"
-    ACKNOWLEDGED = "acknowledged"
-    BLOCKED = "blocked"
+    OPEN = "OPEN"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    BLOCKED = "BLOCKED"
+    UNASSIGNED = "UNASSIGNED"
+    RESOLVED = "RESOLVED"
+
+
+class MFSProvider(str, Enum):
+    BKASH = "bKash"
+    NAGAD = "Nagad"
+    ROCKET = "Rocket"
 
 
 class Severity(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    CRITICAL = "critical"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"

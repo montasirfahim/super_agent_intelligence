@@ -5,11 +5,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.api.router import api_router
+from app.startup import create_all_tables
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Super Agent Intelligence", version="0.1.0")
     app.include_router(api_router)
+
+    @app.on_event("startup")
+    def startup_event() -> None:
+        create_all_tables()
 
     @app.get("/", include_in_schema=False)
     async def root_page():
