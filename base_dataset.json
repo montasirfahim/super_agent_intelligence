@@ -1047,6 +1047,9 @@
             "tx_id": "tx54",
             "agent_id": "agent1000",
             "provider_id": "rocket",
+            "customer_id_hash": "cust_hash_301",
+            "tx_type": "CASH_IN",
+            "amount": "2500.00",
             "timestamp": "2026-06-11T09:30:00"
         },
         {
@@ -2516,5 +2519,249 @@
             "amount": "20100.00",
             "timestamp": "2026-07-10T13:00:00"
         }
-    ]
+    ],
+    
+  "providerwallet": [
+    {
+      "wallet_id": "wallet_agent1_bkash",
+      "agent_id": "agent1",
+      "provider_id": "bkash",
+      "e_money_balance": "45000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent1_nagad",
+      "agent_id": "agent1",
+      "provider_id": "nagad",
+      "e_money_balance": "32000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent1_rocket",
+      "agent_id": "agent1",
+      "provider_id": "rocket",
+      "e_money_balance": "28000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent1000_bkash",
+      "agent_id": "agent1000",
+      "provider_id": "bkash",
+      "e_money_balance": "38000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent1000_nagad",
+      "agent_id": "agent1000",
+      "provider_id": "nagad",
+      "e_money_balance": "25000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent1000_rocket",
+      "agent_id": "agent1000",
+      "provider_id": "rocket",
+      "e_money_balance": "18000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent2_bkash",
+      "agent_id": "agent2",
+      "provider_id": "bkash",
+      "e_money_balance": "65000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent2_nagad",
+      "agent_id": "agent2",
+      "provider_id": "nagad",
+      "e_money_balance": "52000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent2_rocket",
+      "agent_id": "agent2",
+      "provider_id": "rocket",
+      "e_money_balance": "48000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent3_bkash",
+      "agent_id": "agent3",
+      "provider_id": "bkash",
+      "e_money_balance": "42000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent3_nagad",
+      "agent_id": "agent3",
+      "provider_id": "nagad",
+      "e_money_balance": "35000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent3_rocket",
+      "agent_id": "agent3",
+      "provider_id": "rocket",
+      "e_money_balance": "22000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent4_bkash",
+      "agent_id": "agent4",
+      "provider_id": "bkash",
+      "e_money_balance": "15000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent4_nagad",
+      "agent_id": "agent4",
+      "provider_id": "nagad",
+      "e_money_balance": "8000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent4_rocket",
+      "agent_id": "agent4",
+      "provider_id": "rocket",
+      "e_money_balance": "12000.00",
+      
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent5_bkash",
+      "agent_id": "agent5",
+      "provider_id": "bkash",
+      "e_money_balance": "20000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent5_nagad",
+      "agent_id": "agent5",
+      "provider_id": "nagad",
+      "e_money_balance": "11000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent5_rocket",
+      "agent_id": "agent5",
+      "provider_id": "rocket",
+      "e_money_balance": "9500.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent6_bkash",
+      "agent_id": "agent6",
+      "provider_id": "bkash",
+      "e_money_balance": "35000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent6_nagad",
+      "agent_id": "agent6",
+      "provider_id": "nagad",
+      "e_money_balance": "28000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent6_rocket",
+      "agent_id": "agent6",
+      "provider_id": "rocket",
+      "e_money_balance": "30000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent16_bkash",
+      "agent_id": "agent16",
+      "provider_id": "bkash",
+      "e_money_balance": "6000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent16_nagad",
+      "agent_id": "agent16",
+      "provider_id": "nagad",
+      "e_money_balance": "5000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent16_rocket",
+      "agent_id": "agent16",
+      "provider_id": "rocket",
+      "e_money_balance": "7500.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent17_bkash",
+      "agent_id": "agent17",
+      "provider_id": "bkash",
+      "e_money_balance": "5500.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent17_nagad",
+      "agent_id": "agent17",
+      "provider_id": "nagad",
+      "e_money_balance": "7000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent17_rocket",
+      "agent_id": "agent17",
+      "provider_id": "rocket",
+      "e_money_balance": "6200.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent18_bkash",
+      "agent_id": "agent18",
+      "provider_id": "bkash",
+      "e_money_balance": "35000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent18_nagad",
+      "agent_id": "agent18",
+      "provider_id": "nagad",
+      "e_money_balance": "28000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    },
+    {
+      "wallet_id": "wallet_agent18_rocket",
+      "agent_id": "agent18",
+      "provider_id": "rocket",
+      "e_money_balance": "42000.00",
+       
+      "last_sync_time": "2026-07-11T08:00:00"
+    }
+  ]
+
 }

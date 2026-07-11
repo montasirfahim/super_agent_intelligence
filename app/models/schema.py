@@ -145,7 +145,7 @@ class TransactionStream(SQLModel, table=True):
     provider_id: str = Field(foreign_key="provider.id")
     customer_id_hash: str
     tx_type: TransactionType
-    tx_day: str # Normal-Day, Eid-eve, Pay-Day
+    tx_day: Optional[str] = None # Normal-Day, Eid-eve, Pay-Day
     amount: Decimal
     timestamp: datetime
 
