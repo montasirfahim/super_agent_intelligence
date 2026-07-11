@@ -1,0 +1,385 @@
+{
+    "providers": [
+        {
+            "id": "bkash",
+            "provider_name": "bKash"
+        },
+        {
+            "id": "nagad",
+            "provider_name": "Nagad"
+        },
+        {
+            "id": "rocket",
+            "provider_name": "Rocket"
+        }
+    ],
+    "divisions": [
+        {
+            "div_id": "dhaka",
+            "div_name": "Dhaka"
+        },
+        {
+            "div_id": "chattogram",
+            "div_name": "Chattogram"
+        },
+        {
+            "div_id": "sylhet",
+            "div_name": "Sylhet"
+        }
+    ],
+
+    "risk-analyst": [
+        {"id": "1", "name": "risk1", "provider_id": "bkash", "div_id": "dhaka"},
+        {"id": "2", "name": "risk2", "provider_id": "nagad", "div_id": "dhaka"},
+        {"id": "3", "name": "risk3", "provider_id": "rocket", "div_id": "dhaka"},
+        {"id": "4", "name": "risk4", "provider_id": "bkash", "div_id": "chattogram"},
+        {"id": "5", "name": "risk5", "provider_id": "nagad", "div_id": "chattogram"},
+        {"id": "6", "name": "risk6", "provider_id": "rocket", "div_id": "chattogram"},
+        {"id": "7", "name": "risk7", "provider_id": "bkash", "div_id": "sylhet"},
+        {"id": "8", "name": "risk8", "provider_id": "nagad", "div_id": "sylhet"},
+        {"id": "9", "name": "risk9", "provider_id": "rocket", "div_id": "sylhet"}
+    ],
+
+     "territory-officer": [
+        {
+            "id": "1",
+            "name": "to1",
+            "provider_id": "bkash",
+            "div_id": "dhaka",
+            "area_name": "Gazipur",
+            "risk_analyst_id": "1"
+        },
+        {
+            "id": "2",
+            "name": "to2",
+            "provider_id": "nagad",
+            "div_id": "dhaka",
+            "area_name": "Gazipur",
+            "risk_analyst_id": "2"
+        },
+        {
+            "id": "3",
+            "name": "to3",
+            "provider_id": "rocket",
+            "div_id": "dhaka",
+            "area_name": "Gazipur",
+            "risk_analyst_id": "3"
+        },
+        {
+            "id": "4",
+            "name": "to4",
+            "provider_id": "bkash",
+            "div_id": "dhaka",
+            "area_name": "Gulshan",
+            "risk_analyst_id": "1"
+        },
+        {
+            "id": "5",
+            "name": "to5",
+            "provider_id": "nagad",
+            "div_id": "dhaka",
+            "area_name": "Gulshan",
+            "risk_analyst_id": "2"
+        },
+        {
+            "id": "6",
+            "name": "to6",
+            "provider_id": "rocket",
+            "div_id": "dhaka",
+            "area_name": "Gulshan",
+            "risk_analyst_id": "3"
+        },
+        {
+            "id": "7",
+            "name": "to7",
+            "provider_id": "bkash",
+            "div_id": "dhaka",
+            "area_name": "Dhanmondi",
+            "risk_analyst_id": "1"
+        },
+        {
+            "id": "8",
+            "name": "to8",
+            "provider_id": "nagad",
+            "div_id": "dhaka",
+            "area_name": "Dhanmondi",
+            "risk_analyst_id": "2"
+        },
+        {
+            "id": "9",
+            "name": "to9",
+            "provider_id": "rocket",
+            "div_id": "dhaka",
+            "area_name": "Dhanmondi",
+            "risk_analyst_id": "3"
+        },
+        {
+            "id": "10",
+            "name": "to10",
+            "provider_id": "bkash",
+            "div_id": "chattogram",
+            "area_name": "Halishahar",
+            "risk_analyst_id": "4"
+        },
+        {
+            "id": "11",
+            "name": "to11",
+            "provider_id": "nagad",
+            "div_id": "chattogram",
+            "area_name": "Halishahar",
+            "risk_analyst_id": "5"
+        },
+        {
+            "id": "12",
+            "name": "to12",
+            "provider_id": "rocket",
+            "div_id": "chattogram",
+            "area_name": "Halishahar",
+            "risk_analyst_id": "6"
+        },
+        {
+            "id": "13",
+            "name": "to13",
+            "provider_id": "bkash",
+            "div_id": "chattogram",
+            "area_name": "Pahartali",
+            "risk_analyst_id": "4"
+        },
+        {
+            "id": "14",
+            "name": "to14",
+            "provider_id": "nagad",
+            "div_id": "chattogram",
+            "area_name": "Pahartali",
+            "risk_analyst_id": "5"
+        },
+        {
+            "id": "15",
+            "name": "to15",
+            "provider_id": "rocket",
+            "div_id": "chattogram",
+            "area_name": "Pahartali",
+            "risk_analyst_id": "6"
+        },
+        {
+            "id": "16",
+            "name": "to16",
+            "provider_id": "bkash",
+            "div_id": "chattogram",
+            "area_name": "Patenga",
+            "risk_analyst_id": "4"
+        },
+        {
+            "id": "17",
+            "name": "to17",
+            "provider_id": "nagad",
+            "div_id": "chattogram",
+            "area_name": "Patenga",
+            "risk_analyst_id": "5"
+        },
+        {
+            "id": "18",
+            "name": "to18",
+            "provider_id": "rocket",
+            "div_id": "chattogram",
+            "area_name": "Patenga",
+            "risk_analyst_id": "6"
+        },
+        {
+            "id": "19",
+            "name": "to19",
+            "provider_id": "bkash",
+            "div_id": "sylhet",
+            "area_name": "Osmani Nagar",
+            "risk_analyst_id": "7"
+        },
+        {
+            "id": "20",
+            "name": "to20",
+            "provider_id": "nagad",
+            "div_id": "sylhet",
+            "area_name": "Osmani Nagar",
+            "risk_analyst_id": "8"
+        },
+        {
+            "id": "21",
+            "name": "to21",
+            "provider_id": "rocket",
+            "div_id": "sylhet",
+            "area_name": "Osmani Nagar",
+            "risk_analyst_id": "9"
+        },
+        {
+            "id": "22",
+            "name": "to22",
+            "provider_id": "bkash",
+            "div_id": "sylhet",
+            "area_name": "Kumargaon",
+            "risk_analyst_id": "7"
+        },
+        {
+            "id": "23",
+            "name": "to23",
+            "provider_id": "nagad",
+            "div_id": "sylhet",
+            "area_name": "Kumargaon",
+            "risk_analyst_id": "8"
+        },
+        {
+            "id": "24",
+            "name": "to24",
+            "provider_id": "rocket",
+            "div_id": "sylhet",
+            "area_name": "Kumargaon",
+            "risk_analyst_id": "9"
+        },
+        {
+            "id": "25",
+            "name": "to25",
+            "provider_id": "bkash",
+            "div_id": "sylhet",
+            "area_name": "Takarkandi",
+            "risk_analyst_id": "7"
+        },
+        {
+            "id": "26",
+            "name": "to26",
+            "provider_id": "nagad",
+            "div_id": "sylhet",
+            "area_name": "Takarkandi",
+            "risk_analyst_id": "8"
+        },
+        {
+            "id": "27",
+            "name": "to27",
+            "provider_id": "rocket",
+            "div_id": "sylhet",
+            "area_name": "Takarkandi",
+            "risk_analyst_id": "9"
+        }
+    ],
+
+    "agent": [
+        {
+            "agent_id": "agent1",
+            "shop_name": "Prime Cash Express",
+            "area": "Gazipur",
+            "district": "Dhaka",
+            "shared_physical_cash": "500000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent1000",
+            "shop_name": "Prime Cash Express",
+            "area": "Gazipur",
+            "district": "Dhaka",
+            "shared_physical_cash": "450000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent2",
+            "shop_name": "Quick Money Point",
+            "area": "Gulshan",
+            "district": "Dhaka",
+            "shared_physical_cash": "750000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent3",
+            "shop_name": "Digital Bazaar",
+            "area": "Dhanmondi",
+            "district": "Dhaka",
+            "shared_physical_cash": "500000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent4",
+            "shop_name": "Mobile Finance Hub",
+            "area": "Halishahar",
+            "district": "Chattogram",
+            "shared_physical_cash": "45000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent5",
+            "shop_name": "E-Wallet Center",
+            "area": "Pahartali",
+            "district": "Chattogram",
+            "shared_physical_cash": "55000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent6",
+            "shop_name": "Cash & Go",
+            "area": "Kotwali",
+            "district": "Chattogram",
+            "shared_physical_cash": "95000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent16",
+            "shop_name": "Tele-Money",
+            "area": "Osmani Nagar",
+            "district": "Sylhet",
+            "shared_physical_cash": "12000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent17",
+            "shop_name": "Net Finance",
+            "area": "Kumargaon",
+            "district": "Sylhet",
+            "shared_physical_cash": "11000.00",
+            "status": "ACTIVE"
+        },
+        {
+            "agent_id": "agent18",
+            "shop_name": "Click & Pay",
+            "area": "Takarkandi",
+            "district": "Sylhet",
+            "shared_physical_cash": "79000.00",
+            "status": "ACTIVE"
+        }
+    ],
+    "agent-provider-assignment": [
+        {"id": 1, "agent-id": "agent1", "provider_id": "bkash", "to-officer-id": "1"},
+        {"id": 2, "agent-id": "agent1", "provider_id": "nagad", "to-officer-id": "2"},
+        {"id": 3, "agent-id": "agent1", "provider_id": "rocket", "to-officer-id": "3"},
+        
+        {"id": 4, "agent-id": "agent1000", "provider_id": "bkash", "to-officer-id": "1"},
+        {"id": 5, "agent-id": "agent1000", "provider_id": "nagad", "to-officer-id": "2"},
+        {"id": 6, "agent-id": "agent1000", "provider_id": "rocket", "to-officer-id": "3"},
+        
+        {"id": 7, "agent-id": "agent2", "provider_id": "bkash", "to-officer-id": "4"},
+        {"id": 8, "agent-id": "agent2", "provider_id": "nagad", "to-officer-id": "5"},
+        {"id": 9, "agent-id": "agent2", "provider_id": "rocket", "to-officer-id": "6"},
+        
+        {"id": 10, "agent-id": "agent3", "provider_id": "bkash", "to-officer-id": "7"},
+        {"id": 11, "agent-id": "agent3", "provider_id": "nagad", "to-officer-id": "8"},
+        {"id": 12, "agent-id": "agent3", "provider_id": "rocket", "to-officer-id": "9"},
+        
+        {"id": 13, "agent-id": "agent4", "provider_id": "bkash", "to-officer-id": "10"},
+        {"id": 14, "agent-id": "agent4", "provider_id": "nagad", "to-officer-id": "11"},
+        {"id": 15, "agent-id": "agent4", "provider_id": "rocket", "to-officer-id": "12"},
+        
+        {"id": 16, "agent-id": "agent5", "provider_id": "bkash", "to-officer-id": "13"},
+        {"id": 17, "agent-id": "agent5", "provider_id": "nagad", "to-officer-id": "14"},
+        {"id": 18, "agent-id": "agent5", "provider_id": "rocket", "to-officer-id": "15"},
+        
+        {"id": 19, "agent-id": "agent6", "provider_id": "bkash", "to-officer-id": "16"},
+        {"id": 20, "agent-id": "agent6", "provider_id": "nagad", "to-officer-id": "17"},
+        {"id": 21, "agent-id": "agent6", "provider_id": "rocket", "to-officer-id": "18"},
+        
+        {"id": 22, "agent-id": "agent16", "provider_id": "bkash", "to-officer-id": "19"},
+        {"id": 23, "agent-id": "agent16", "provider_id": "nagad", "to-officer-id": "20"},
+        {"id": 24, "agent-id": "agent16", "provider_id": "rocket", "to-officer-id": "21"},
+        
+        {"id": 25, "agent-id": "agent17", "provider_id": "bkash", "to-officer-id": "22"},
+        {"id": 26, "agent-id": "agent17", "provider_id": "nagad", "to-officer-id": "23"},
+        {"id": 27, "agent-id": "agent17", "provider_id": "rocket", "to-officer-id": "24"},
+        
+        {"id": 28, "agent-id": "agent18", "provider_id": "bkash", "to-officer-id": "25"},
+        {"id": 29, "agent-id": "agent18", "provider_id": "nagad", "to-officer-id": "26"},
+        {"id": 30, "agent-id": "agent18", "provider_id": "rocket", "to-officer-id": "27"}
+    ]
+}
