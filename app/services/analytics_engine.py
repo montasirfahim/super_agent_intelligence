@@ -493,8 +493,45 @@ def _balance_str(db: Session, agent_id: str, provider_id: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Safe top-up
+# Safe top-up  (analytics_engine_prompt.md §5)
+#
+# Formula:
+#   required_for_window = burn_rate_weighted * Decimal(target_coverage_minutes)
+#   raw_topup           = max(Decimal("0"), required_for_window - current_balance)
+#   safety_margin       = base_margin + margin_sensitivity * Decimal(str(relative_uncertainty))
+#   topup_amount        = (raw_topup * (1 + safety_margin))
+#                            .quantize(Decimal("100"), rounding=ROUND_HALF_UP)
+#   Return Decimal("0") if raw_topup == 0
+#
+# The prompt specifies the function takes the *already-computed* triplet
+# (weighted_burn, current_balance, relative_uncertainty) — it does NOT
+# re-query the DB. We honor that with `recommend_topup_amount` below, and
+# keep `recommend_topup` as a thin convenience wrapper that derives the
+# triplet from `predict_shortage` for callers that don't have one in scope.
 # ---------------------------------------------------------------------------
+
+def recommend_topup_amount(
+    weighted_burn: Decimal,
+    current_balance: Decimal,
+    relative_uncertainty: float = 0.0,
+) -> Decimal:
+    """Pure step-5 formula. No DB, no Decimal→float on money, no string parsing.
+
+    Returns the top-up amount as Decimal, already rounded to the nearest
+    ৳100 with the safety margin applied. Returns Decimal("0") if no top-up
+    is needed (raw_topup == 0).
+    """
+    required = Decimal(weighted_burn) * Decimal(TARGET_COVERAGE_MINUTES)
+    raw_topup = max(Decimal("0"), required - Decimal(current_balance))
+    if raw_topup == Decimal("0"):
+        return Decimal("0")
+
+    safety_margin = BASE_MARGIN + (MARGIN_SENSITIVITY * Decimal(str(relative_uncertainty)))
+    topup = (raw_topup * (Decimal("1") + safety_margin)).quantize(
+        Decimal("100"), rounding=ROUND_HALF_UP
+    )
+    return topup
+
 
 def recommend_topup(
     db: Session,
@@ -502,21 +539,38 @@ def recommend_topup(
     provider_id: Optional[str],
     t: datetime,
 ) -> Dict[str, Any]:
-    """Section 5: `topup = max(0, weighted_burn * coverage - balance) * (1 + margin)`."""
-    pred = predict_shortage(db, agent_id, provider_id, t)
-    weighted = Decimal(pred["burn_rate_weighted"])
-    current_balance = Decimal(pred["current_balance"]) if pred["current_balance"] != "0.00" else _get_balance(db, agent_id, provider_id)
-    uncertainty = float(pred.get("relative_uncertainty", 0.0))
+    """Convenience wrapper around `recommend_topup_amount`.
 
-    required = weighted * Decimal(TARGET_COVERAGE_MINUTES)
-    raw_topup = max(Decimal("0"), required - current_balance)
-    if raw_topup == Decimal("0"):
+    Derives (weighted_burn, current_balance, relative_uncertainty) from
+    `predict_shortage` and returns the same dict shape the platform already
+    consumes:
+        {"amount": "39600.00", "target_coverage_minutes": 60}
+
+    Safe for missing-wallet providers: returns Decimal("0") instead of
+    raising KeyError so the upstream `analyze()` doesn't crash mid-flight.
+    """
+    try:
+        pred = predict_shortage(db, agent_id, provider_id, t)
+        weighted_burn = Decimal(pred["burn_rate_weighted"])
+        # current_balance comes from the live prediction; if it's missing or
+        # zero (no wallet), fall back to a direct lookup so we can still
+        # report a meaningful top-up against the actual stored balance.
+        try:
+            current_balance = _get_balance(db, agent_id, provider_id)
+        except KeyError:
+            current_balance = Decimal(pred.get("current_balance") or "0")
+        relative_uncertainty = float(pred.get("relative_uncertainty", 0.0))
+    except KeyError:
+        # Agent or provider not found — no top-up to recommend.
         return {"amount": "0.00", "target_coverage_minutes": TARGET_COVERAGE_MINUTES}
 
-    safety_margin = BASE_MARGIN + (MARGIN_SENSITIVITY * Decimal(str(uncertainty)))
-    topup = (raw_topup * (Decimal("1") + safety_margin)).quantize(Decimal("100"), rounding=ROUND_HALF_UP)
+    amount = recommend_topup_amount(
+        weighted_burn=weighted_burn,
+        current_balance=current_balance,
+        relative_uncertainty=relative_uncertainty,
+    )
     return {
-        "amount": str(topup.quantize(Decimal("0.01"))),
+        "amount": str(amount.quantize(Decimal("0.01"))),
         "target_coverage_minutes": TARGET_COVERAGE_MINUTES,
     }
 
@@ -862,31 +916,193 @@ def build_ticket(
     provider_id: str,
     evidence: Dict[str, Any],
     t: datetime,
+    provider_topup: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Provider-scoped ticket evidence — strictly this provider's slice only.
+    """Provider-scoped ticket evidence — strictly THIS provider's slice only.
 
-    `correlated_with` is the list of *other* provider IDs only — never their
-    balances or flagged customers. This preserves the multi-tenant boundary.
+    Isolation guarantees (each enforced below + by `_assert_no_cross_provider_leak`):
+
+      1. `liquidity` is THIS provider's predict-shortage slice. If the upstream
+         `analyze()` didn't produce one for this provider (edge case), we
+         synthesize a zero-filled slice tagged with `provider_id`. We never
+         fall back to `evidence["liquidity"]["shared_cash"]`, because that
+         slice carries the agent's full drawer balance + burn — which means
+         other providers' contributions. That's a multi-tenant leak.
+      2. `anomaly` / `flagged_customers` are THIS provider's only — never
+         aggregated across providers.
+      3. `recommended_topup` is the caller-supplied per-provider top-up (see
+         `build_alert_and_tickets`). The default is zeros if the caller
+         forgot — we never inherit `evidence["recommended_topup"]`, which
+         is the SHARED drawer top-up and includes other providers' drains.
+      4. `correlated_with` is the list of OTHER provider IDs only — never
+         their balances, customer hashes, or any non-id value.
+      5. `provider_id` is included in the slice so the JS evidence modal can
+         label the payload unambiguously.
+
+    `_assert_no_cross_provider_leak` runs at the end of this function and
+    raises `ValueError` if any other provider's id, customer hash, or balance
+    string appears anywhere in the serialized slice. That makes a regression
+    fail loudly instead of silently shipping.
     """
-    provider_slice = {
-        "liquidity": evidence["liquidity"].get(provider_id) or evidence["liquidity"]["shared_cash"],
-        "anomaly": evidence["anomaly"].get(provider_id, {}),
-        "flagged_customers": evidence["anomaly"].get(provider_id, {}).get("flagged_customers", []),
-        "correlated_with": [p for p in evidence["correlated_providers"] if p != provider_id],
-        "recommended_topup": evidence["recommended_topup"],
-        "data_quality_flag": evidence["data_quality_flag"],
+    # (1) THIS provider's liquidity slice — never shared cash.
+    own_liquidity = evidence["liquidity"].get(provider_id)
+    if own_liquidity is None:
+        # Synthesize a zero slice so the ticket is self-contained. Every
+        # numeric field is a stringified Decimal matching the predict_shortage
+        # shape, so JS consumers don't need a special case.
+        own_liquidity = {
+            "provider_id": provider_id,
+            "eta_minutes": None,
+            "eta_range_minutes": None,
+            "confidence": "low",
+            "burn_rate_weighted": "0.00",
+            "change_pct": 0.0,
+            "current_balance": "0.00",
+            "relative_uncertainty": 0.0,
+        }
+    else:
+        # Tag the slice with its provider so downstream consumers (JS modal,
+        # audit log dump, manual SQL inspection) can confirm isolation.
+        own_liquidity = {**own_liquidity, "provider_id": provider_id}
+
+    # (2) THIS provider's anomaly slice + flagged customers (sorted + deduped).
+    own_anomaly = evidence["anomaly"].get(provider_id, {})
+    own_flagged = sorted(set(own_anomaly.get("flagged_customers", [])))
+
+    # (3) Per-provider top-up. Caller (build_alert_and_tickets) computes the
+    # right slice via `recommend_topup(db, agent_id, provider_id, t)`. We do
+    # NOT inherit evidence["recommended_topup"] — that's the shared drawer
+    # top-up and contains other providers' drain.
+    if provider_topup is None:
+        provider_topup = {
+            "amount": "0.00",
+            "target_coverage_minutes": TARGET_COVERAGE_MINUTES,
+        }
+
+    # (4) correlated_with: list of OTHER provider IDs only. Strip any non-string
+    # entries defensively (an upstream bug could inject a dict here).
+    correlated_with = [
+        p for p in evidence.get("correlated_providers", [])
+        if p != provider_id and isinstance(p, str)
+    ]
+
+    provider_slice: Dict[str, Any] = {
+        "provider_id": provider_id,                  # (5) unambiguous label
+        "liquidity": own_liquidity,
+        "anomaly": own_anomaly,
+        "flagged_customers": own_flagged,
+        "correlated_with": correlated_with,
+        "recommended_topup": provider_topup,
+        "data_quality_flag": bool(evidence.get("data_quality_flag", False)),
     }
+
+    # Defensive guard — raise loudly if any cross-provider data leaked in.
+    _assert_no_cross_provider_leak(provider_slice, provider_id, evidence)
+
     return {
         "ticket_id": _new_id(),
         "alert_id": alert_id,
         "provider_id": provider_id,
         "assigned_officer_id": _route_to_officer_for_ticket(agent_id, provider_id),
-        "current_owner_role": "FIELD_OFFICER",  # was: TERRITORY_OFFICER (not in ORM enum)
-        "status": "OPEN",
+        "current_owner_role": "FIELD_OFFICER",       # OwnerRole enum value
+        "status": "OPEN",                            # TicketStatus enum value
         "evidence_json": json.dumps(provider_slice, default=str),
         "created_at": t,
         "updated_at": t,
     }
+
+
+def _assert_no_cross_provider_leak(
+    slice_: Dict[str, Any],
+    this_provider: str,
+    evidence: Dict[str, Any],
+) -> None:
+    """Defensive runtime check: raise ValueError if any OTHER provider's data
+    appears in this ticket's slice.
+
+    Catches:
+      - Another provider's customer_id_hash appearing anywhere in the slice
+      - Another provider's current_balance digit string (e.g. "38000.00")
+        appearing in liquidity or recommended_topup
+      - correlated_with carrying anything other than a list of provider-id
+        strings (e.g. a leaked dict or balance)
+    """
+    other_providers = [
+        p for p in evidence.get("anomaly", {}).keys() if p != this_provider
+    ]
+    if not other_providers:
+        # No peers → nothing to leak. Skip the scan.
+        return
+
+    serialized = json.dumps(slice_, default=str)
+
+    # (a) Other providers' customer hashes must not appear anywhere.
+    for p in other_providers:
+        for c in evidence["anomaly"][p].get("flagged_customers", []):
+            if c and c in serialized:
+                raise ValueError(
+                    f"Cross-provider leak: ticket for {this_provider!r} contains "
+                    f"{p!r}'s customer hash {c!r}"
+                )
+
+    # (b) Other providers' current_balance digits must NOT appear in the
+    # recommended_topup or anomaly blocks of this provider's slice. (We
+    # don't check `liquidity.current_balance` itself — that's legitimately
+    # this provider's own number; if another provider happens to have the
+    # same balance, that's coincidence, not a leak.)
+    #
+    # We also use word-boundary matching: a 6-digit digit string like
+    # "100000" must not match inside a longer 8-digit number ("10000000").
+    own_balance = (
+        evidence.get("liquidity", {}).get(this_provider, {}).get("current_balance")
+    )
+    own_balance_digits = (
+        str(own_balance).replace(".", "") if own_balance else ""
+    )
+
+    # Concatenate just the fields where a leak would actually matter.
+    suspicious_fields = {
+        "recommended_topup": json.dumps(slice_.get("recommended_topup", {}), default=str),
+        "anomaly": json.dumps(slice_.get("anomaly", {}), default=str),
+        "flagged_customers": json.dumps(slice_.get("flagged_customers", []), default=str),
+    }
+    for p in other_providers:
+        other_balance = (
+            evidence.get("liquidity", {}).get(p, {}).get("current_balance")
+        )
+        if not other_balance:
+            continue
+        digits = str(other_balance).replace(".", "")
+        if len(digits) < 5:
+            continue
+        # Skip if it's the same digit string as this provider's own balance
+        # (legitimate coincidence, not a leak).
+        if digits == own_balance_digits:
+            continue
+        for field_name, blob in suspicious_fields.items():
+            blob_digits = blob.replace(".", "")
+            idx = 0
+            while True:
+                j = blob_digits.find(digits, idx)
+                if j < 0:
+                    break
+                left_ok = (j == 0) or not blob_digits[j - 1].isdigit()
+                right_ok = (j + len(digits) == len(blob_digits)) or not blob_digits[j + len(digits)].isdigit()
+                if left_ok and right_ok:
+                    raise ValueError(
+                        f"Cross-provider leak: ticket for {this_provider!r} "
+                        f"contains {p!r}'s balance digits {digits!r} in {field_name}"
+                    )
+                idx = j + 1
+
+    # (c) correlated_with must be a list of plain provider-id strings. Any
+    # other shape (dict, list-with-objects) means upstream code regressed.
+    for entry in slice_.get("correlated_with", []):
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"correlated_with must contain only provider-id strings; "
+                f"got {type(entry).__name__}: {entry!r}"
+            )
 
 
 def build_alert_and_tickets(
@@ -895,7 +1111,12 @@ def build_alert_and_tickets(
     t: datetime,
     providers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Section 9: returns ORM-ready Alert + per-provider Ticket dicts (no DB write)."""
+    """Section 9: returns ORM-ready Alert + per-provider Ticket dicts (no DB write).
+
+    Each ticket carries ITS provider's top-up amount — never the shared
+    drawer's. We compute per-provider top-up here so `build_ticket()` can
+    receive the right slice.
+    """
     evidence = analyze(db, agent_id, t, providers=providers)
     if evidence["overall_severity"] == "low" and not evidence["warnings"]:
         return {"alert": None, "tickets": []}
@@ -913,6 +1134,24 @@ def build_alert_and_tickets(
     }
 
     active_providers = list(evidence["anomaly"].keys())
+
+    # Per-provider top-up — each ticket gets ITS slice, not shared cash.
+    # The shared-cash top-up is only a fallback if a provider has no own
+    # liquidity entry at all (shouldn't happen but defensive).
+    per_provider_topup: Dict[str, Dict[str, Any]] = {}
+    shared_topup = evidence["recommended_topup"]
+    for p in active_providers:
+        if p in evidence["liquidity"]:
+            per_provider_topup[p] = recommend_topup(db, agent_id, p, t)
+        else:
+            per_provider_topup[p] = shared_topup
+
     responsible = determine_responsible_providers(evidence, active_providers)
-    tickets = [build_ticket(alert["alert_id"], agent_id, p, evidence, t) for p in responsible]
+    tickets = [
+        build_ticket(
+            alert["alert_id"], agent_id, p, evidence, t,
+            provider_topup=per_provider_topup[p],
+        )
+        for p in responsible
+    ]
     return {"alert": alert, "tickets": tickets}

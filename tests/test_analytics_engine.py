@@ -7,6 +7,7 @@ the real seeded DB via the FastAPI app's TestClient.
 """
 from __future__ import annotations
 
+import json
 import statistics
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -438,3 +439,252 @@ def test_analyze_empty_agent_returns_evidence(db, monkeypatch):
     evidence = ae.analyze(db, "a1", t, providers=["1"])
     assert evidence["agent_id"] == "a1"
     assert evidence["overall_severity"] in ("low", "medium", "high")
+
+
+# ---------------------------------------------------------------------------
+# 12. build_ticket: no shared-cash fallback in this provider's liquidity
+# ---------------------------------------------------------------------------
+
+def test_build_ticket_no_shared_cash_fallback(db, monkeypatch):
+    """The bKash ticket's `liquidity` slice MUST NOT carry the agent's
+    shared-cash drawer balance — that's a multi-tenant leak."""
+    _seed_minimal(db)
+    t = datetime(2026, 7, 12, 10, 0)
+
+    # Make analyze() return a tiny shared drawer + a big bKash wallet so we
+    # can detect if the shared-cash balance string sneaks into the bKash ticket.
+    monkeypatch.setattr(ae, "predict_shortage", lambda *a, **k: {
+        "eta_minutes": 60, "eta_range_minutes": [50, 70],
+        "confidence": "high", "burn_rate_weighted": "1000.00",
+        "change_pct": 50.0, "current_balance": "999.00",
+        "relative_uncertainty": 0.1,
+    })
+    monkeypatch.setattr(ae, "detect_velocity_anomaly", lambda *a, **k: {
+        "velocity_anomaly": False, "velocity_score": 1.0,
+        "triggering_window": None,
+    })
+    monkeypatch.setattr(ae, "detect_structuring", lambda *a, **k: {
+        "structuring_anomaly": False, "structuring_ratio": 0.0,
+        "flagged_customers": [],
+    })
+    monkeypatch.setattr(ae, "detect_cross_provider_correlation", lambda *a, **k: {
+        "correlated_providers": [], "correlated": False, "severity_multiplier": 1.0,
+    })
+    monkeypatch.setattr(ae, "check_balance_reconciliation", lambda *a, **k: {
+        "data_quality_flag": False, "reconciliation_error_pct": 0.0,
+    })
+
+    # Custom shared_cash balance that's wildly different from bKash's
+    # wallet balance. If the bKash ticket carries "450000.00" the leak
+    # detection will catch it.
+    def fake_analyze(_db, agent_id, _t, providers=None):
+        return {
+            "agent_id": agent_id, "evaluated_at": _t.isoformat(),
+            "liquidity": {
+                "shared_cash": {"eta_minutes": None, "eta_range_minutes": None,
+                                "confidence": "low", "burn_rate_weighted": "0.00",
+                                "change_pct": 0.0, "current_balance": "450000.00",
+                                "relative_uncertainty": 0.0},
+                "1": {"eta_minutes": 60, "eta_range_minutes": [50, 70],
+                      "confidence": "high", "burn_rate_weighted": "1000.00",
+                      "change_pct": 50.0, "current_balance": "999.00",
+                      "relative_uncertainty": 0.1},
+            },
+            "recommended_topup": {"amount": "100000.00", "target_coverage_minutes": 60},
+            "anomaly": {"1": {"velocity_anomaly": True, "velocity_score": 5.0,
+                              "triggering_window": 5,
+                              "structuring_anomaly": False, "structuring_ratio": 0.0,
+                              "flagged_customers": []}},
+            "correlated_providers": [], "overall_severity": "medium",
+            "warnings": [], "data_quality_flag": False, "shared_uncertainty": 0.0,
+        }
+    monkeypatch.setattr(ae, "analyze", fake_analyze)
+    monkeypatch.setattr(ae, "recommend_topup", lambda *a, **k: {
+        "amount": "5000.00", "target_coverage_minutes": 60,
+    })
+
+    result = ae.build_alert_and_tickets(db, "a1", t, providers=["1"])
+    assert result["alert"] is not None
+    assert len(result["tickets"]) == 1
+    ticket = result["tickets"][0]
+    evidence = json.loads(ticket["evidence_json"])
+
+    # bKash ticket must carry ITS balance, NOT shared_cash
+    assert evidence["provider_id"] == "1"
+    assert evidence["liquidity"]["current_balance"] == "999.00"
+    assert "450000.00" not in json.dumps(evidence), \
+        "bKash ticket leaked shared-cash balance 450000.00"
+    # Top-up is bKash-specific (5000), not shared (100000)
+    assert evidence["recommended_topup"]["amount"] == "5000.00"
+
+
+# ---------------------------------------------------------------------------
+# 13. build_ticket: top-up is per-provider, never shared
+# ---------------------------------------------------------------------------
+
+def test_build_ticket_topup_is_provider_specific(db, monkeypatch):
+    """When the shared burn is 75% bKash / 25% Nagad, the bKash ticket's
+    recommended_topup.amount MUST be computed from bKash's burn rate."""
+    _seed_minimal(db)
+    db.add(Provider(id="2", provider_name="Nagad"))
+    db.add(TerritoryOffice(id="to2", name="TO-2", provider_id="2",
+                           div_id="dhk", area_name="Dhaka", risk_analyst_id="ra1"))
+    db.add(ProviderWallet(wallet_id="w2", agent_id="a1", provider_id="2",
+                          e_money_balance=Decimal("30000.00"),
+                          last_sync_time=datetime(2026, 7, 12, 10, 0)))
+    db.commit()
+    t = datetime(2026, 7, 12, 10, 0)
+
+    # Each provider's burn → its own top-up
+    monkeypatch.setattr(ae, "predict_shortage", lambda *a, **k: {
+        "eta_minutes": None, "eta_range_minutes": None, "confidence": "low",
+        "burn_rate_weighted": "5000.00", "change_pct": 0.0,
+        "current_balance": "1000.00", "relative_uncertainty": 0.0,
+    })
+
+    # recommend_topup is called per provider → distinct amounts
+    def fake_topup(_db, _agent_id, provider_id, _t):
+        return {
+            "1": {"amount": "300000.00", "target_coverage_minutes": 60},
+            "2": {"amount": "100000.00", "target_coverage_minutes": 60},
+        }[provider_id]
+    monkeypatch.setattr(ae, "recommend_topup", fake_topup)
+    monkeypatch.setattr(ae, "analyze", lambda *a, **k: {
+        "agent_id": "a1", "evaluated_at": t.isoformat(),
+        "liquidity": {
+            "shared_cash": {"eta_minutes": None, "eta_range_minutes": None,
+                            "confidence": "low", "burn_rate_weighted": "0.00",
+                            "change_pct": 0.0, "current_balance": "50000.00",
+                            "relative_uncertainty": 0.0},
+            "1": {"eta_minutes": None, "eta_range_minutes": None, "confidence": "low",
+                  "burn_rate_weighted": "5000.00", "change_pct": 0.0,
+                  "current_balance": "1000.00", "relative_uncertainty": 0.0},
+            "2": {"eta_minutes": None, "eta_range_minutes": None, "confidence": "low",
+                  "burn_rate_weighted": "5000.00", "change_pct": 0.0,
+                  "current_balance": "1000.00", "relative_uncertainty": 0.0},
+        },
+        "recommended_topup": {"amount": "999999.00",  # SHARED — must NOT appear in tickets
+                              "target_coverage_minutes": 60},
+        "anomaly": {
+            "1": {"velocity_anomaly": True, "velocity_score": 5.0,
+                  "triggering_window": 5, "structuring_anomaly": False,
+                  "structuring_ratio": 0.0, "flagged_customers": []},
+            "2": {"velocity_anomaly": True, "velocity_score": 4.0,
+                  "triggering_window": 5, "structuring_anomaly": False,
+                  "structuring_ratio": 0.0, "flagged_customers": []},
+        },
+        "correlated_providers": ["1", "2"], "overall_severity": "medium",
+        "warnings": [], "data_quality_flag": False, "shared_uncertainty": 0.0,
+    })
+
+    result = ae.build_alert_and_tickets(db, "a1", t, providers=["1", "2"])
+    assert result["alert"] is not None
+    by_p = {tk["provider_id"]: json.loads(tk["evidence_json"]) for tk in result["tickets"]}
+
+    # Each ticket carries its OWN top-up
+    assert by_p["1"]["recommended_topup"]["amount"] == "300000.00"
+    assert by_p["2"]["recommended_topup"]["amount"] == "100000.00"
+    # Shared top-up (999999) must not appear in either ticket
+    assert "999999.00" not in json.dumps(by_p["1"])
+    assert "999999.00" not in json.dumps(by_p["2"])
+
+
+# ---------------------------------------------------------------------------
+# 14. _assert_no_cross_provider_leak raises on injected cross-provider data
+# ---------------------------------------------------------------------------
+
+def test_assert_no_cross_provider_leak_raises_on_customer_hash():
+    """A bug that injects another provider's customer hash into a ticket
+    must fail loudly via _assert_no_cross_provider_leak, not silently ship."""
+    corrupt_slice = {
+        "provider_id": "1",
+        "liquidity": {"current_balance": "100.00"},
+        "anomaly": {"flagged_customers": ["cust_nagad_secret"]},
+        "flagged_customers": ["cust_nagad_secret"],
+        "correlated_with": ["2"],
+        "recommended_topup": {"amount": "100.00", "target_coverage_minutes": 60},
+        "data_quality_flag": False,
+    }
+    evidence = {
+        "anomaly": {
+            "1": {"flagged_customers": []},
+            "2": {"flagged_customers": ["cust_nagad_secret"]},  # the leak source
+        },
+        "liquidity": {
+            "1": {"current_balance": "100.00"},
+            "2": {"current_balance": "500.00"},
+        },
+    }
+    with pytest.raises(ValueError, match="Cross-provider leak"):
+        ae._assert_no_cross_provider_leak(corrupt_slice, "1", evidence)
+
+
+def test_assert_no_cross_provider_leak_raises_on_balance_digits():
+    """A bug that injects another provider's balance digits into a ticket
+    must fail loudly."""
+    corrupt_slice = {
+        "provider_id": "1",
+        "liquidity": {"current_balance": "100.00"},
+        "anomaly": {"flagged_customers": []},
+        "flagged_customers": [],
+        "correlated_with": [],
+        "recommended_topup": {"amount": "12345.00", "target_coverage_minutes": 60},  # leaks nagad digits
+        "data_quality_flag": False,
+    }
+    evidence = {
+        "anomaly": {
+            "1": {"flagged_customers": []},
+            "2": {"flagged_customers": []},
+        },
+        "liquidity": {
+            "1": {"current_balance": "100.00"},
+            "2": {"current_balance": "12345.00"},  # leak source
+        },
+    }
+    with pytest.raises(ValueError, match="Cross-provider leak"):
+        ae._assert_no_cross_provider_leak(corrupt_slice, "1", evidence)
+
+
+def test_assert_no_cross_provider_leak_raises_on_bad_correlated_with():
+    """correlated_with must be a list of provider-id strings; a dict means
+    upstream regressed."""
+    corrupt_slice = {
+        "provider_id": "1",
+        "liquidity": {"current_balance": "100.00"},
+        "anomaly": {"flagged_customers": []},
+        "flagged_customers": [],
+        "correlated_with": [{"balance": "500"}],  # wrong shape
+        "recommended_topup": {"amount": "100.00", "target_coverage_minutes": 60},
+        "data_quality_flag": False,
+    }
+    evidence = {
+        "anomaly": {"1": {"flagged_customers": []}, "2": {"flagged_customers": []}},
+        "liquidity": {"1": {"current_balance": "100.00"}, "2": {"current_balance": "500.00"}},
+    }
+    with pytest.raises(ValueError, match="must contain only provider-id strings"):
+        ae._assert_no_cross_provider_leak(corrupt_slice, "1", evidence)
+
+
+def test_assert_no_cross_provider_leak_passes_on_clean_slice():
+    """A well-formed isolated ticket must NOT raise."""
+    clean_slice = {
+        "provider_id": "1",
+        "liquidity": {"current_balance": "100.00", "burn_rate_weighted": "500.00"},
+        "anomaly": {"flagged_customers": ["cust_bk_1"]},
+        "flagged_customers": ["cust_bk_1"],
+        "correlated_with": ["2"],
+        "recommended_topup": {"amount": "500.00", "target_coverage_minutes": 60},
+        "data_quality_flag": False,
+    }
+    evidence = {
+        "anomaly": {
+            "1": {"flagged_customers": ["cust_bk_1"]},
+            "2": {"flagged_customers": ["cust_ng_1"]},
+        },
+        "liquidity": {
+            "1": {"current_balance": "100.00", "burn_rate_weighted": "500.00"},
+            "2": {"current_balance": "200.00", "burn_rate_weighted": "300.00"},
+        },
+    }
+    # Should not raise
+    ae._assert_no_cross_provider_leak(clean_slice, "1", evidence)
