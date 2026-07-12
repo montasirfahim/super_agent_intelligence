@@ -100,8 +100,7 @@ class TerritoryOffice(SQLModel, table=True):
     assignments: List["AgentProviderAssignment"] = Relationship(back_populates="territory_office")
     tickets: List["Ticket"] = Relationship(back_populates="assigned_officer")
 
-
-class Agent(SQLModel, table=True):
+class Agent(SQLModel, table=True): 
     agent_id: str = Field(primary_key=True)
     shop_name: str
     area: str

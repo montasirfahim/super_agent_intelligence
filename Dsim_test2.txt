@@ -1,0 +1,31 @@
+start: sim_76a5608de396
+t= 1s: txns= 1 ticks= 1 alerts=0 err=None
+t= 2s: txns= 1 ticks= 1 alerts=0 err=None
+t= 3s: txns= 2 ticks= 2 alerts=0 err=None
+t= 4s: txns= 3 ticks= 3 alerts=0 err=None
+t= 5s: txns= 3 ticks= 3 alerts=0 err=None
+t= 6s: txns= 4 ticks= 4 alerts=0 err=None
+t= 7s: txns= 4 ticks= 4 alerts=0 err=None
+t= 8s: txns= 4 ticks= 4 alerts=0 err=None
+t= 9s: txns= 4 ticks= 4 alerts=0 err=None
+t=10s: txns= 4 ticks= 4 alerts=0 err=None
+t=11s: txns= 4 ticks= 4 alerts=0 err=None
+t=12s: txns= 4 ticks= 4 alerts=0 err=None
+t=13s: txns= 4 ticks= 4 alerts=0 err=None
+t=14s: txns= 4 ticks= 4 alerts=0 err=None
+t=15s: txns= 4 ticks= 4 alerts=0 err=None
+t=16s: txns= 4 ticks= 4 alerts=1 err=None
+t=17s: txns= 4 ticks= 4 alerts=1 err=None
+t=18s: txns= 5 ticks= 5 alerts=1 err=None
+t=19s: txns= 6 ticks= 6 alerts=1 err=None
+t=20s: txns= 6 ticks= 6 alerts=1 err=None
+t=21s: txns= 6 ticks= 6 alerts=1 err=None
+t=22s: txns= 6 ticks= 6 alerts=1 err=None
+t=23s: txns= 6 ticks= 6 alerts=1 err=None
+t=24s: txns= 6 ticks= 6 alerts=1 err=None
+t=25s: txns= 6 ticks= 6 alerts=1 err=None
+t=26s: txns= 6 ticks= 6 alerts=1 err=None
+t=27s: txns= 6 ticks= 6 alerts=1 err=None
+t=28s: txns= 6 ticks= 6 alerts=1 err=None
+t=29s: txns= 6 ticks= 6 alerts=1 err=None
+t=30s: txns= 6 ticks= 6 alerts=2 err=None

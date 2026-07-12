@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
-from app.startup import create_all_tables
+from app.startup import startup as app_startup
 
 
 TEMPLATES = Path(__file__).parent / "templates"
@@ -16,7 +16,12 @@ STATIC = TEMPLATES / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    create_all_tables()
+    # On every process boot: ensure schema exists, then reset every
+    # Agent.shared_physical_cash + ProviderWallet.e_money_balance to
+    # the canonical values from base_dataset.json. This means a server
+    # restart always shows the seed balances on the dashboard — no
+    # leftover drain from the previous run.
+    app_startup()
     yield
 
 

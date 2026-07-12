@@ -129,6 +129,47 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
     if not agent:
         raise HTTPException(404, f"Agent {agent_id} not found")
 
+    # ----------------------------------------------------------------
+    # Authoritative draining totals — must run BEFORE wallet-card build
+    # so each wallet card can carry its own Σ since-sim-start totals.
+    # Computed from ALL `simlive_` txns (not just the last 15), which
+    # fixes the previous bug where the client-side ledger silently
+    # truncated its running totals to whatever fit in the last-15 view.
+    # ----------------------------------------------------------------
+    sim_txns = db.exec(
+        select(TransactionStream)
+        .where(TransactionStream.agent_id == agent_id)
+        .where(TransactionStream.tx_id.like("simlive_%"))
+    ).all()
+
+    overall_cash_in = 0.0
+    overall_cash_out = 0.0
+    overall_count = 0
+    by_provider: dict[str, dict[str, float]] = {
+        "1": {"cash_in": 0.0, "cash_out": 0.0, "tx_count": 0},
+        "2": {"cash_in": 0.0, "cash_out": 0.0, "tx_count": 0},
+        "3": {"cash_in": 0.0, "cash_out": 0.0, "tx_count": 0},
+    }
+    for t in sim_txns:
+        amt = float(t.amount)
+        pid = t.provider_id
+        if pid not in by_provider:
+            continue
+        if t.tx_type == TransactionType.CASH_OUT:
+            overall_cash_out += amt
+            by_provider[pid]["cash_out"] += amt
+        else:
+            overall_cash_in += amt
+            by_provider[pid]["cash_in"] += amt
+        by_provider[pid]["tx_count"] += 1
+        overall_count += 1
+
+    overall_net = overall_cash_in - overall_cash_out
+    by_provider_net = {
+        pid: {"net": v["cash_in"] - v["cash_out"], **v}
+        for pid, v in by_provider.items()
+    }
+
     # Wallets for this agent (one per provider they're assigned to)
     wallets = db.exec(
         select(ProviderWallet).where(ProviderWallet.agent_id == agent_id)
@@ -144,6 +185,7 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
     wallet_cards = []
     for p in all_providers:
         w = wallet_by_provider.get(p["id"])
+        prov_totals = by_provider_net.get(p["id"], {"cash_in": 0.0, "cash_out": 0.0, "net": 0.0, "tx_count": 0})
         if w is None:
             wallet_cards.append({
                 "provider_id": p["id"],
@@ -152,16 +194,31 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
                 "balance_fmt": fmt_bdt(0),
                 "last_sync_time": "—",
                 "has_wallet": False,
+                # Server-authoritative since-sim-start totals, surfaced
+                # even on a missing-wallet card so the dashboard always
+                # shows what's draining.
+                "cash_in_total":  round(prov_totals["cash_in"], 2),
+                "cash_out_total": round(prov_totals["cash_out"], 2),
+                "net_total":      round(prov_totals["net"], 2),
+                "tx_count_total": int(prov_totals["tx_count"]),
+                "cash_in_fmt":    fmt_bdt(prov_totals["cash_in"]),
+                "cash_out_fmt":   fmt_bdt(prov_totals["cash_out"]),
+                "net_fmt":        fmt_bdt(abs(prov_totals["net"])),
+                "direction":      "DRAINING" if prov_totals["net"] < 0 else "STABLE",
             })
             continue
 
         # Velocity from recent transactions on this wallet
         cutoff = now_naive() - timedelta(minutes=30)
+        from sqlalchemy import or_, not_ as _not
         txns = db.exec(
             select(TransactionStream)
             .where(TransactionStream.agent_id == agent_id)
             .where(TransactionStream.provider_id == p["id"])
             .where(TransactionStream.timestamp >= cutoff)
+            .where(
+                _not(or_(*[TransactionStream.tx_id.like(pfx + "%") for pfx in ("live_wallet_",)]))
+            )
         ).all()
         out_v, in_v = velocity_bdt_per_min(txns, 30)
         forecast = compute_t_runaway(w.e_money_balance, out_v, in_v)
@@ -178,9 +235,20 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
             "t_runaway": forecast["t_minutes"],
             "t_runaway_fmt": "Stable" if not forecast["depleting"] else f"{int(forecast['t_minutes'])} min",
             "severity": severity_from_runway(forecast["t_minutes"]),
+            # Server-authoritative since-sim-start totals — fed into the
+            # wallet card so the deductions/additions lines match the
+            # real running sum, not just the last-15 sample.
+            "cash_in_total":  round(prov_totals["cash_in"], 2),
+            "cash_out_total": round(prov_totals["cash_out"], 2),
+            "net_total":      round(prov_totals["net"], 2),
+            "tx_count_total": int(prov_totals["tx_count"]),
+            "cash_in_fmt":    fmt_bdt(prov_totals["cash_in"]),
+            "cash_out_fmt":   fmt_bdt(prov_totals["cash_out"]),
+            "net_fmt":        fmt_bdt(abs(prov_totals["net"])),
+            "direction":      "DRAINING" if prov_totals["net"] < 0 else "STABLE",
         })
 
-    # Physical cash forecast
+    # Physical cash forecast (last 30 min velocity window)
     cutoff = now_naive() - timedelta(minutes=30)
     all_txns = db.exec(
         select(TransactionStream)
@@ -190,10 +258,18 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
     out_v, in_v = velocity_bdt_per_min(all_txns, 30)
     physical_forecast = compute_t_runaway(agent.shared_physical_cash, out_v, in_v)
 
-    # Recent transactions (last 15)
+    # Recent transactions (last 15) — for the live table view only.
+    # Totals above are computed from sim_txns (all of them), not from
+    # this list. Exclude the legacy `live_wallet_*` synthetic prefix so
+    # stale rows from a removed seed path stop showing up here until
+    # the next reset wipes them.
+    from sqlalchemy import or_, not_
     recent_txns = db.exec(
         select(TransactionStream)
         .where(TransactionStream.agent_id == agent_id)
+        .where(
+            not_(or_(*[TransactionStream.tx_id.like(p + "%") for p in ("live_wallet_",)]))
+        )
         .order_by(TransactionStream.timestamp.desc())
         .limit(15)
     ).all()
@@ -224,11 +300,51 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
             "inflow_velocity": round(in_v, 1),
             "t_runaway_fmt": "Stable" if not physical_forecast["depleting"] else f"{int(physical_forecast['t_minutes'])} min",
             "severity": severity_from_runway(physical_forecast["t_minutes"]),
+            # Server-authoritative since-sim-start totals.
+            "cash_in_total":  round(overall_cash_in, 2),
+            "cash_out_total": round(overall_cash_out, 2),
+            "net_total":      round(overall_net, 2),
+            "tx_count_total": overall_count,
+            "cash_in_fmt":    fmt_bdt(overall_cash_in),
+            "cash_out_fmt":   fmt_bdt(overall_cash_out),
+            "net_fmt":        fmt_bdt(abs(overall_net)),
+            "direction":      "DRAINING" if overall_net < 0 else "STABLE",
         },
         "wallets": wallet_cards,
+        # Authoritative draining totals — across every sim txn for this
+        # agent, not just the last 15 in `recent_transactions`. Used by
+        # the dashboard to show how much has actually drained, in BDT,
+        # since the sim started. The starting balance is implicit:
+        # starting = current_balance + (cash_out − cash_in).
+        "draining_totals": {
+            "overall": {
+                "cash_in":    round(overall_cash_in, 2),
+                "cash_out":   round(overall_cash_out, 2),
+                "net":        round(overall_net, 2),
+                "tx_count":   overall_count,
+                "cash_in_fmt":  fmt_bdt(overall_cash_in),
+                "cash_out_fmt": fmt_bdt(overall_cash_out),
+                "net_fmt":      fmt_bdt(abs(overall_net)),
+                "direction":     "DRAINING" if overall_net < 0 else "STABLE",
+            },
+            "by_provider": {
+                pid: {
+                    "cash_in":     round(v["cash_in"], 2),
+                    "cash_out":    round(v["cash_out"], 2),
+                    "net":         round(v["net"], 2),
+                    "tx_count":    int(v["tx_count"]),
+                    "cash_in_fmt":  fmt_bdt(v["cash_in"]),
+                    "cash_out_fmt": fmt_bdt(v["cash_out"]),
+                    "net_fmt":      fmt_bdt(abs(v["net"])),
+                    "direction":     "DRAINING" if v["net"] < 0 else "STABLE",
+                }
+                for pid, v in by_provider_net.items()
+            },
+        },
         "recent_transactions": [
             {
                 "tx_id": t.tx_id,
+                "provider_id": t.provider_id,                # numeric '1'/'2'/'3' for client-side ledger routing
                 "provider": PROVIDER_NAME.get(t.provider_id, t.provider_id),
                 "type": t.tx_type.value if hasattr(t.tx_type, "value") else str(t.tx_type),
                 "amount_fmt": fmt_bdt(t.amount),

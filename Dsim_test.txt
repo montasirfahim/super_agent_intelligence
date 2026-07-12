@@ -1,0 +1,16 @@
+start: sim_0bc0afb2e087
+t= 1s: txns= 1 ticks= 1 alerts=0
+t= 2s: txns= 1 ticks= 1 alerts=0
+t= 3s: txns= 2 ticks= 2 alerts=0
+t= 4s: txns= 3 ticks= 3 alerts=0
+t= 5s: txns= 3 ticks= 3 alerts=0
+t= 6s: txns= 4 ticks= 4 alerts=0
+t= 7s: txns= 4 ticks= 4 alerts=0
+t= 8s: txns= 4 ticks= 4 alerts=0
+t= 9s: txns= 4 ticks= 4 alerts=0
+t=10s: txns= 4 ticks= 4 alerts=0
+t=11s: txns= 4 ticks= 4 alerts=0
+t=12s: txns= 4 ticks= 4 alerts=0
+t=13s: txns= 4 ticks= 4 alerts=0
+t=14s: txns= 4 ticks= 4 alerts=0
+t=15s: txns= 4 ticks= 4 alerts=0

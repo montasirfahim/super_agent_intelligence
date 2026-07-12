@@ -31,177 +31,574 @@
 <script>
   const fmtBDT = (n) => '৳' + Math.round(n).toLocaleString('en-IN');
 
-  // Profile stashed at login
+  // ---------- Profile stashed at login ----------
   let JSON_PROFILE = null;
   try { JSON_PROFILE = JSON.parse(sessionStorage.getItem('login_profile') || 'null'); } catch (_) {}
 
-  // ---------- Live physical-cash simulation ----------
-  // Seed the ledger from the agent's starting cash (e.g. ৳500,000 for agent1).
-  // Every poll, we diff new CASH_OUT / CASH_IN transactions and deduct/add to
-  // the running balance client-side. This makes the agent's drawer visibly
-  // drain as new live txns arrive — the simulation engine's main user signal.
+  // ---------- Live physical-cash ledger (client-side) ----------
   const STARTING_CASH = (JSON_PROFILE && JSON_PROFILE.profile
                          && typeof JSON_PROFILE.profile.shared_physical_cash === 'number')
                         ? JSON_PROFILE.profile.shared_physical_cash
                         : 0;
   const liveCash = DASH.LiveCash.create({ starting_cash: STARTING_CASH });
 
-  // ---------- Live provider-wallet simulation ----------
-  // One ledger per provider wallet, seeded from base_dataset.json's
-  // "providerwallet" array (passed through login_profile.profile.provider_wallets).
-  // Each new txn is routed to its provider's ledger and added to the running balance.
+  // ---------- Live provider-wallet ledger (client-side, one per provider) ----------
   const JSON_WALLETS = (JSON_PROFILE && JSON_PROFILE.profile
                         && Array.isArray(JSON_PROFILE.profile.provider_wallets))
                        ? JSON_PROFILE.profile.provider_wallets
                        : [];
   const liveWallet = DASH.LiveWallet.create(JSON_WALLETS);
 
+  // ---------- Track what we've already rendered ----------
+  // Polling should append NEW txns / alerts, not rebuild the whole page.
+  const seenTxnIds = new Set();
+  const seenAlertIds = new Set();
+  let firstRenderDone = false;
+  let lastSimRunning = false;
+
+  // ============================================================
+  //  Layout builders — produce stable DOM nodes with stable IDs
+  //  so we can mutate them in place on every poll.
+  // ============================================================
+
+  function buildSimStartBlock() {
+    return `
+      <div class="card" style="margin-bottom:1rem;text-align:center;padding:1.4rem;">
+        <h2 style="margin-bottom:0.4rem;">Start Simulation</h2>
+        <p style="color:var(--text-dim);margin:0 0 1rem 0;font-size:0.9rem;">
+          Select how long the simulation should run, then click Start. The
+          system will seed natural-looking bKash / Nagad / Rocket
+          transactions, compare each new cash-in / cash-out against your
+          historical pattern, and surface an alert to the territory officer
+          if your burn rate spikes.
+        </p>
+        <div style="display:inline-flex;align-items:center;gap:0.6rem;margin-bottom:0.8rem;">
+          <label for="sim-window-select" style="font-size:0.85rem;color:var(--text-dim);">Simulation window:</label>
+          <select id="sim-window-select" style="background:var(--bg-card-2);color:var(--text);border:1px solid var(--border);padding:0.4rem 0.6rem;border-radius:6px;font-size:0.95rem;">
+            <option value="5">5 minutes</option>
+            <option value="10">10 minutes</option>
+            <option value="30" selected>30 minutes</option>
+          </select>
+        </div>
+        <div>
+          <button id="start-sim-btn" onclick="startSimulation()"
+            style="background:var(--accent);color:#0c1d3a;border:none;padding:0.55rem 1.4rem;border-radius:6px;cursor:pointer;font-weight:600;font-size:0.95rem;">
+            ▶ Start Simulation
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function buildSimRunningBlock(sim) {
+    const startedShort = (sim.started_at || '').slice(11, 19);
+    const endsShort    = (sim.ends_at    || '').slice(11, 19);
+    const txCount      = sim.txns_injected || 0;
+    const alertCount   = sim.alerts_generated || 0;
+    const ticksDone    = sim.ticks_elapsed || 0;
+    const ticksTotal   = sim.ticks_total || 0;
+    const progressPct  = ticksTotal > 0 ? Math.round(100 * ticksDone / ticksTotal) : 0;
+    return `
+      <div class="card" style="margin-bottom:1rem;">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:1rem;">
+          <span class="badge sev-LOW" style="background:var(--accent);color:#0c1d3a;font-weight:700;">● SIM RUNNING</span>
+          <div style="font-size:0.85rem;color:var(--text-dim);">
+            <span>Window: <strong style="color:var(--text);" id="sim-window">${sim.window_minutes || '—'} min</strong></span>
+            <span style="margin-left:0.8rem;">Started: <strong style="color:var(--text);" id="sim-started">${startedShort}</strong></span>
+            <span style="margin-left:0.8rem;">Ends: <strong style="color:var(--text);" id="sim-ends">${endsShort}</strong></span>
+            <span style="margin-left:0.8rem;">Ticks: <strong style="color:var(--text);" id="sim-ticks">${ticksDone}/${ticksTotal}</strong></span>
+            <span style="margin-left:0.8rem;">Txns: <strong style="color:var(--text);" id="sim-txns">${txCount}</strong></span>
+            <span style="margin-left:0.8rem;">Alerts: <strong style="color:${alertCount > 0 ? 'var(--red)' : 'var(--green)'};" id="sim-alerts">${alertCount}</strong></span>
+          </div>
+          <div style="flex:1;min-width:160px;background:var(--bg-card-2);border-radius:6px;height:8px;overflow:hidden;">
+            <div id="sim-progress" style="height:100%;width:${progressPct}%;background:var(--accent);transition:width 0.5s;"></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function buildLiveSectionsShell() {
+    return `
+      <div class="grid cols-2" id="live-sections" style="margin-top:1rem;">
+        <div class="card">
+          <h2>Recent Transactions <small style="color:var(--text-dim);font-weight:400;">Last 15</small></h2>
+          <table id="txn-table">
+            <thead>
+              <tr><th>Time</th><th>Provider</th><th>Type</th><th style="text-align:right;">Amount</th><th>Customer Hash</th></tr>
+            </thead>
+            <tbody id="txn-tbody">
+              <tr id="txn-empty-row"><td colspan="5"><div class="empty">No transactions yet. Waiting for the first sim tick…</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Active Alerts <small style="color:var(--text-dim);font-weight:400;" id="alerts-count">0</small></h2>
+          <div id="alerts-list">
+            <div class="empty" id="alerts-empty">No alerts yet. Burn rate is within historical norms.</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function buildLayout(data, simStatus) {
+    const a = data.agent;
+    const phys = data.physical || {};
+    const wlist = data.wallets || [];
+    const totals = data.draining_totals || { overall: {}, by_provider: {} };
+    const p = (JSON_PROFILE && JSON_PROFILE.profile) || {};
+    const headerShop = p.shop_name || a.shop_name;
+    const headerArea = p.area || a.area;
+    const headerDist = p.district || a.district;
+
+    // Server-authoritative numbers — computed from ALL sim txns, not
+    // from the 15-txn client-side ledger. This is the actual current
+    // balance and the actual cumulative draining totals.
+    const physBalance  = phys.balance || 0;
+    const physCashOut  = phys.cash_out_total || 0;
+    const physCashIn   = phys.cash_in_total || 0;
+    const physNet      = phys.net_total || (physCashIn - physCashOut);
+    const physTxCount  = phys.tx_count_total || 0;
+    const physDraining = physNet < 0;
+    const physAccent   = physDraining ? 'var(--red)' : 'var(--green)';
+
+    // "Starting" derives implicitly: starting = current + (cash_out − cash_in).
+    // This stays consistent with the visible drained amount even though
+    // we no longer trust the client-side ledger.
+    const physStarting = physBalance + (physCashOut - physCashIn);
+
+    const physicalCard = `
+      <div class="balance-card physical" id="card-physical">
+        <div class="label">Shared Physical Cash Drawer</div>
+        <div class="amount" id="physical-amount" style="color:${physAccent};transition:color 0.4s;">${fmtBDT(physBalance)}</div>
+        <div class="meta">
+          <span title="Starting balance before any sim txn">Starting: <strong id="physical-starting">${fmtBDT(physStarting)}</strong></span>
+        </div>
+        <div class="runway">
+          <span title="Total cash-outs across every sim txn">−<span id="physical-deductions">${fmtBDT(physCashOut)}</span> <small style="opacity:0.6;">(<span id="physical-txcount">${physTxCount}</span> txns)</small></span>
+          <span title="Total cash-ins across every sim txn" style="color:var(--green);">+<span id="physical-additions">${fmtBDT(physCashIn)}</span></span>
+        </div>
+        <div class="runway">
+          <span>Net movement: <strong id="physical-net" style="color:${physDraining ? 'var(--red)' : 'var(--green)'};">${fmtBDT(physNet)}</strong></span>
+          <span class="badge sev-LOW" id="physical-badge">${physDraining ? 'DRAINING' : 'STABLE'}</span>
+        </div>
+        <div class="runway" id="physical-this-poll" style="background:rgba(56,189,248,0.08);padding:0.4rem 0.6rem;border-radius:6px;margin-top:0.4rem;display:none;">
+          <span style="color:var(--accent);font-size:0.78rem;" id="physical-this-poll-text"></span>
+        </div>
+      </div>
+    `;
+
+    // Provider name → lowercase key (bkash / nagad / rocket) for stable IDs
+    const WALLET_KEY = { 'bKash': 'bkash', 'Nagad': 'nagad', 'Rocket': 'rocket' };
+    // Also build a fallback starting balance from JSON profile for the
+    // "Starting:" line on each wallet card.
+    const jsonWalletStarting = new Map();
+    for (const w of JSON_WALLETS) {
+      const k = String(w.provider_id || '').toLowerCase();
+      if (k && typeof w.e_money_balance === 'number') jsonWalletStarting.set(k, w.e_money_balance);
+    }
+    const walletCards = wlist.map((w) => {
+      const pkey = WALLET_KEY[w.provider_name] || String(w.provider_name).toLowerCase();
+      const wDrain = (w.net_total || 0) < 0;
+      const wAccent = wDrain ? 'var(--red)' : 'var(--green)';
+      // Starting balance: implicit = current + (cash_out − cash_in)
+      const wCashOut = w.cash_out_total || 0;
+      const wCashIn  = w.cash_in_total || 0;
+      const wBalance = w.balance || 0;
+      const wStarting = wBalance + (wCashOut - wCashIn);
+      return `
+        <div class="balance-card ${pkey}" id="card-wallet-${pkey}">
+          <div class="label">${DASH.escapeHtml(w.provider_name)} E-Money</div>
+          <div class="amount" id="wallet-${pkey}-amount" style="color:${wAccent};transition:color 0.4s;">${fmtBDT(wBalance)}</div>
+          <div class="meta">
+            <span title="Starting balance before any sim txn">Starting: <strong id="wallet-${pkey}-starting">${fmtBDT(wStarting)}</strong></span>
+          </div>
+          <div class="runway">
+            <span title="Total cash-outs across every sim txn for this wallet">−<span id="wallet-${pkey}-deductions">${fmtBDT(wCashOut)}</span> <small style="opacity:0.6;">(<span id="wallet-${pkey}-txcount">${w.tx_count_total || 0}</span> txns)</small></span>
+            <span title="Total cash-ins across every sim txn for this wallet" style="color:var(--green);">+<span id="wallet-${pkey}-additions">${fmtBDT(wCashIn)}</span></span>
+          </div>
+          <div class="runway">
+            <span>Net: <strong id="wallet-${pkey}-net" style="color:${wDrain ? 'var(--red)' : 'var(--green)'};">${fmtBDT(w.net_total || (wCashIn - wCashOut))}</strong></span>
+            <span class="badge sev-LOW" id="wallet-${pkey}-badge">${wDrain ? 'DRAINING' : 'STABLE'}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    const profileBlock = `
+      <div class="card" style="margin-bottom:1rem;">
+        <h2>Agent Profile</h2>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem 1.25rem;font-size:0.9rem;">
+          <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Agent ID</div><div><code>${DASH.escapeHtml(p.agent_id || a.agent_id)}</code></div></div>
+          <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Shop</div><div>${DASH.escapeHtml(headerShop)}</div></div>
+          <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Area</div><div>${DASH.escapeHtml(headerArea)}</div></div>
+          <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">District</div><div>${DASH.escapeHtml(headerDist)}</div></div>
+          <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Status</div><div><span class="pill">${DASH.escapeHtml(p.status || a.status || '—')}</span></div></div>
+        </div>
+      </div>
+    `;
+
+    const simRunning = !!simStatus.running;
+    const simControlHtml = simRunning ? buildSimRunningBlock(simStatus.sim || {}) : buildSimStartBlock();
+    const liveSectionsHtml = simRunning ? buildLiveSectionsShell() : '';
+
+    return `
+      <h1 class="section-title">Agent View <small>${DASH.escapeHtml(headerShop)} · ${DASH.escapeHtml(headerArea)}, ${DASH.escapeHtml(headerDist)}</small></h1>
+      ${profileBlock}
+      <div id="sim-control-slot">${simControlHtml}</div>
+      <div class="grid cols-4" id="balance-cards">${physicalCard}${walletCards}</div>
+      <div id="live-sections-slot">${liveSectionsHtml}</div>
+    `;
+  }
+
+  // ============================================================
+  //  Partial DOM updates — called on every poll, only mutates the
+  //  fields that actually changed. No more full-page repaint.
+  // ============================================================
+
+  function setText(id, txt) {
+    const el = document.getElementById(id);
+    if (el && el.textContent !== String(txt)) el.textContent = txt;
+  }
+
+  function setStyle(id, prop, val) {
+    const el = document.getElementById(id);
+    if (el) el.style[prop] = val;
+  }
+
+  function updateBalances(data) {
+    // Server-authoritative totals — Σ across ALL sim txns since sim
+    // started, computed by /api/dashboard/agent. The client-side
+    // LiveCash / LiveWallet ledgers are NOT used here: they were
+    // capped at 15 txns and silently truncated the running totals.
+    const phys = (data && data.physical) || {};
+    const wlist = (data && data.wallets) || [];
+    const WALLET_KEY = { 'bKash': 'bkash', 'Nagad': 'nagad', 'Rocket': 'rocket' };
+
+    const physBalance  = phys.balance || 0;
+    const physCashOut  = phys.cash_out_total || 0;
+    const physCashIn   = phys.cash_in_total || 0;
+    const physNet      = phys.net_total != null ? phys.net_total : (physCashIn - physCashOut);
+    const physTxCount  = phys.tx_count_total || 0;
+    const physDraining = physNet < 0;
+    const physAccent   = physDraining ? 'var(--red)' : 'var(--green)';
+    const physStarting = physBalance + (physCashOut - physCashIn);
+
+    setText('physical-amount',      fmtBDT(physBalance));
+    setStyle('physical-amount',     'color', physAccent);
+    setText('physical-deductions',  fmtBDT(physCashOut));
+    setText('physical-additions',   fmtBDT(physCashIn));
+    setText('physical-txcount',     String(physTxCount));
+    setText('physical-starting',    fmtBDT(physStarting));
+    setText('physical-net',         fmtBDT(physNet));
+    setStyle('physical-net',        'color', physAccent);
+    setText('physical-badge',       physDraining ? 'DRAINING' : 'STABLE');
+
+    for (const w of wlist) {
+      const pkey = WALLET_KEY[w.provider_name] || String(w.provider_name).toLowerCase();
+      const wDrain  = (w.net_total || 0) < 0;
+      const wAccent = wDrain ? 'var(--red)' : 'var(--green)';
+      const wBal    = w.balance || 0;
+      const wOut    = w.cash_out_total || 0;
+      const wIn     = w.cash_in_total || 0;
+      const wNet    = w.net_total != null ? w.net_total : (wIn - wOut);
+      const wStart  = wBal + (wOut - wIn);
+      setText(`wallet-${pkey}-amount`,      fmtBDT(wBal));
+      setStyle(`wallet-${pkey}-amount`,     'color', wAccent);
+      setText(`wallet-${pkey}-deductions`,  fmtBDT(wOut));
+      setText(`wallet-${pkey}-additions`,   fmtBDT(wIn));
+      setText(`wallet-${pkey}-txcount`,     String(w.tx_count_total || 0));
+      setText(`wallet-${pkey}-starting`,    fmtBDT(wStart));
+      setText(`wallet-${pkey}-net`,         fmtBDT(wNet));
+      setStyle(`wallet-${pkey}-net`,        'color', wAccent);
+      setText(`wallet-${pkey}-badge`,       wDrain ? 'DRAINING' : 'STABLE');
+    }
+  }
+
+  function updateSimStatusChip(sim) {
+    if (!sim) return;
+    const ticksDone = sim.ticks_elapsed || 0;
+    const ticksTotal = sim.ticks_total || 0;
+    const progressPct = ticksTotal > 0 ? Math.round(100 * ticksDone / ticksTotal) : 0;
+    setText('sim-window', (sim.window_minutes || '—') + ' min');
+    setText('sim-started', (sim.started_at || '').slice(11, 19));
+    setText('sim-ends',    (sim.ends_at    || '').slice(11, 19));
+    setText('sim-ticks',   `${ticksDone}/${ticksTotal}`);
+    setText('sim-txns',    String(sim.txns_injected || 0));
+    setText('sim-alerts',  String(sim.alerts_generated || 0));
+    const alertsEl = document.getElementById('sim-alerts');
+    if (alertsEl) alertsEl.style.color = (sim.alerts_generated || 0) > 0 ? 'var(--red)' : 'var(--green)';
+    const bar = document.getElementById('sim-progress');
+    if (bar) bar.style.width = `${progressPct}%`;
+  }
+
+  function appendNewTransactions(newTxns) {
+    if (!newTxns || newTxns.length === 0) return;
+    const tbody = document.getElementById('txn-tbody');
+    if (!tbody) return;
+
+    // Remove the empty-state row on first insert
+    const emptyRow = document.getElementById('txn-empty-row');
+    if (emptyRow) emptyRow.remove();
+
+    // newest first (backend already returns desc by timestamp), but
+    // we may receive them out of order — sort by timestamp desc locally.
+    const sorted = [...newTxns].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+
+    // Prepend in order; limit visible rows to last 15 to keep DOM small.
+    for (const t of sorted) {
+      if (seenTxnIds.has(t.tx_id)) continue;
+      seenTxnIds.add(t.tx_id);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${DASH.escapeHtml(t.timestamp || '')}</code></td>
+        <td>${DASH.escapeHtml(t.provider || '')}</td>
+        <td>${DASH.escapeHtml((t.type || '').replace('_', '-'))}</td>
+        <td style="text-align:right;font-variant-numeric:tabular-nums;color:${t.type === 'CASH_OUT' ? 'var(--red)' : 'var(--green)'};">${DASH.escapeHtml(t.amount_fmt || '')}</td>
+        <td><code title="${DASH.escapeHtml(t.customer_hash_short || '')}">${DASH.escapeHtml((t.customer_hash_short || '').slice(0, 10))}…</code></td>
+      `;
+      tbody.insertBefore(tr, tbody.firstChild);
+    }
+    // Trim to last 15 rows so DOM doesn't grow forever.
+    while (tbody.children.length > 15) tbody.removeChild(tbody.lastChild);
+  }
+
+  function appendNewAlerts(newAlerts) {
+    if (!newAlerts || newAlerts.length === 0) return;
+    const list = document.getElementById('alerts-list');
+    if (!list) return;
+
+    const emptyMsg = document.getElementById('alerts-empty');
+    if (emptyMsg) emptyMsg.remove();
+
+    // newest first
+    const sorted = [...newAlerts].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    for (const a of sorted) {
+      if (seenAlertIds.has(a.alert_id)) continue;
+      seenAlertIds.add(a.alert_id);
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.style.marginBottom = '0.6rem';
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
+          <div>
+            <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || '')}</span>
+            <span class="pill">${DASH.escapeHtml((a.alert_type || '').replace('_', ' '))}</span>
+            <span class="pill">C=${(a.confidence_score ?? 0).toFixed(3)}</span>
+          </div>
+          <small class="sub">${DASH.escapeHtml(a.created_at || '')}</small>
+        </div>
+        <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn || '')}</p>
+      `;
+      list.insertBefore(card, list.firstChild);
+    }
+    // Update count chip
+    const countEl = document.getElementById('alerts-count');
+    if (countEl) countEl.textContent = String(seenAlertIds.size);
+  }
+
+  // ============================================================
+  //  Top-level render — picks full layout vs partial update based
+  //  on whether the sim-state changed since last poll.
+  // ============================================================
+
   async function render() {
     const main = document.getElementById('content');
-    main.innerHTML = '<div class="empty">Loading…</div>';
     try {
+      // Always poll sim status first so layout reflects the current state.
+      await pollSimStatus();
       const data = await DASH.api('GET', '/api/dashboard/agent');
-      const a = data.agent;
-      document.getElementById('shop-name').textContent = a.shop_name;
+      document.getElementById('shop-name').textContent = data.agent.shop_name;
 
-      // Apply the latest transaction list to both ledgers
-      const applied = liveCash.applyBatch(data.recent_transactions || []);
-      liveWallet.applyBatch(data.recent_transactions || []);
-      const snap = liveCash.snapshot();
-      const walletSnap = liveWallet.snapshotAll();
+      // Track what counts as "new" for this poll (tx_id / alert_id dedup).
+      const allTxns   = data.recent_transactions || [];
+      const allAlerts = data.alerts || [];
 
-      // Header chips — prefer JSON profile values
-      const p = (JSON_PROFILE && JSON_PROFILE.profile) || {};
-      const headerShop  = p.shop_name  || a.shop_name;
-      const headerArea  = p.area       || a.area;
-      const headerDist  = p.district   || a.district;
-      const jsonSpc     = (typeof p.shared_physical_cash === 'number') ? p.shared_physical_cash : null;
+      // (liveCash.applyBatch / liveWallet.applyBatch intentionally not
+      // called here — the dashboard reads server-authoritative totals
+      // from data.physical.cash_in_total / cash_out_total etc. now, so
+      // the client-side ledgers aren't needed for display.)
 
-      const sevClass = (s) => `sev-${s}`;
+      const simRunning = !!simState.running;
+      const transitioned = (simRunning !== lastSimRunning) || !firstRenderDone;
 
-      // Live balance card — the headline physical cash number now comes from
-      // the client-side ledger, not from the DB column. This makes the
-      // "drained by Eid-eve cash-outs" story visible to judges.
-      const liveBalance = snap.balance;
-      const isDraining = snap.deductions > snap.additions;
-      const liveAccent = isDraining ? 'var(--red)' : 'var(--green)';
-
-      const physicalCard = `
-        <div class="balance-card physical">
-          <div class="label">Shared Physical Cash Drawer</div>
-          <div class="amount" style="color:${liveAccent};transition:color 0.4s;">${fmtBDT(liveBalance)}</div>
-          <div class="meta">
-            <span title="Starting balance at login">Starting: <strong>${fmtBDT(snap.starting)}</strong></span>
-          </div>
-          <div class="runway">
-            <span title="Total cash-outs applied to ledger">−${fmtBDT(snap.deductions)} <small style="opacity:0.6;">(${snap.tx_count} txns)</small></span>
-            <span title="Total cash-ins applied to ledger" style="color:var(--green);">+${fmtBDT(snap.additions)}</span>
-          </div>
-          <div class="runway">
-            <span>Net movement: <strong style="color:${isDraining ? 'var(--red)' : 'var(--green)'};">${fmtBDT(snap.additions - snap.deductions)}</strong></span>
-            <span class="badge ${sevClass('LOW')}">${isDraining ? 'DRAINING' : 'STABLE'}</span>
-          </div>
-          ${applied.newCount > 0 ? `
-            <div class="runway" style="background:rgba(56,189,248,0.08);padding:0.4rem 0.6rem;border-radius:6px;margin-top:0.4rem;">
-              <span style="color:var(--accent);font-size:0.78rem;">
-                ⚡ This poll: ${applied.newCount} new txn${applied.newCount === 1 ? '' : 's'}
-                (${applied.newDeductions > 0 ? '−' + fmtBDT(applied.newDeductions) : ''}${applied.newAdditions > 0 ? ' +' + fmtBDT(applied.newAdditions) : ''})
-              </span>
-            </div>
-          ` : ''}
-        </div>
-      `;
-
-      const balanceCards = physicalCard + Object.entries(walletSnap.per).map(([pkey, w]) => {
-        const isDrainingW = w.deductions > w.additions;
-        const accentW = isDrainingW ? 'var(--red)' : 'var(--green)';
-        return `
-        <div class="balance-card ${pkey}">
-          <div class="label">${w.provider_name} E-Money</div>
-          <div class="amount" style="color:${accentW};transition:color 0.4s;">${fmtBDT(w.balance)}</div>
-          <div class="meta">
-            <span title="Starting balance from base_dataset.json">Starting: <strong>${fmtBDT(w.starting)}</strong></span>
-          </div>
-          <div class="runway">
-            <span title="Total cash-outs applied to this wallet">−${fmtBDT(w.deductions)} <small style="opacity:0.6;">(${w.tx_count} txns)</small></span>
-            <span title="Total cash-ins applied to this wallet" style="color:var(--green);">+${fmtBDT(w.additions)}</span>
-          </div>
-          <div class="runway">
-            <span>Net: <strong style="color:${isDrainingW ? 'var(--red)' : 'var(--green)'};">${fmtBDT(w.additions - w.deductions)}</strong></span>
-            <span class="badge ${sevClass('LOW')}">${isDrainingW ? 'DRAINING' : 'STABLE'}</span>
-          </div>
-        </div>
-      `;
-      }).join('');
-
-      const txns = data.recent_transactions.map(t => `
-        <tr>
-          <td><code>${t.timestamp}</code></td>
-          <td>${t.provider}</td>
-          <td>${t.type.replace('_', '-')}</td>
-          <td style="text-align:right;font-variant-numeric:tabular-nums;color:${t.type === 'CASH_OUT' ? 'var(--red)' : 'var(--green)'};">${t.amount_fmt}</td>
-          <td><code title="${t.customer_hash_short}">${t.customer_hash_short.slice(0, 10)}…</code></td>
-        </tr>
-      `).join('');
-
-      const alerts = data.alerts.length === 0
-        ? `<div class="empty">No active alerts. Operating normally.</div>`
-        : data.alerts.map(a => `
-            <div class="card" style="margin-bottom:0.6rem;">
+      if (transitioned) {
+        // Full layout rebuild — only when sim state changed (rare) or on
+        // first load. This swaps the start-block ↔ live-sections cleanly.
+        main.innerHTML = buildLayout(data, simState);
+        // Reset dedup sets so the rebuild can re-render existing rows.
+        seenTxnIds.clear();
+        seenAlertIds.clear();
+        for (const t of allTxns) seenTxnIds.add(t.tx_id);
+        for (const a of allAlerts) seenAlertIds.add(a.alert_id);
+        // Pre-populate tables/alerts with the existing list so we don't
+        // flash empty-then-fill on the transition render.
+        if (simRunning) {
+          // Insert transactions in chronological order, newest at top.
+          const sortedTxns = [...allTxns].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+          for (const t of sortedTxns) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td><code>${DASH.escapeHtml(t.timestamp || '')}</code></td>
+              <td>${DASH.escapeHtml(t.provider || '')}</td>
+              <td>${DASH.escapeHtml((t.type || '').replace('_', '-'))}</td>
+              <td style="text-align:right;font-variant-numeric:tabular-nums;color:${t.type === 'CASH_OUT' ? 'var(--red)' : 'var(--green)'};">${DASH.escapeHtml(t.amount_fmt || '')}</td>
+              <td><code title="${DASH.escapeHtml(t.customer_hash_short || '')}">${DASH.escapeHtml((t.customer_hash_short || '').slice(0, 10))}…</code></td>
+            `;
+            const tbody = document.getElementById('txn-tbody');
+            if (tbody) tbody.appendChild(tr);
+          }
+          // Trim to 15
+          const tbody = document.getElementById('txn-tbody');
+          if (tbody) {
+            while (tbody.children.length > 15) tbody.removeChild(tbody.lastChild);
+            // Drop the empty-state row if present
+            const emptyRow = document.getElementById('txn-empty-row');
+            if (emptyRow) emptyRow.remove();
+          }
+          // Insert alerts (newest first)
+          const sortedAlerts = [...allAlerts].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          for (const a of sortedAlerts) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.style.marginBottom = '0.6rem';
+            card.innerHTML = `
               <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
                 <div>
-                  <span class="badge sev-${a.severity}">${a.severity}</span>
-                  <span class="pill">${a.alert_type.replace('_', ' ')}</span>
-                  <span class="pill">C=${a.confidence_score.toFixed(3)}</span>
+                  <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || '')}</span>
+                  <span class="pill">${DASH.escapeHtml((a.alert_type || '').replace('_', ' '))}</span>
+                  <span class="pill">C=${(a.confidence_score ?? 0).toFixed(3)}</span>
                 </div>
-                <small class="sub">${a.created_at}</small>
+                <small class="sub">${DASH.escapeHtml(a.created_at || '')}</small>
               </div>
-              <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn)}</p>
-            </div>
-          `).join('');
+              <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn || '')}</p>
+            `;
+            const list = document.getElementById('alerts-list');
+            if (list) list.appendChild(card);
+          }
+          const emptyMsg = document.getElementById('alerts-empty');
+          if (emptyMsg && allAlerts.length > 0) emptyMsg.remove();
+          const countEl = document.getElementById('alerts-count');
+          if (countEl) countEl.textContent = String(allAlerts.length);
+        }
+        lastSimRunning = simRunning;
+        firstRenderDone = true;
+        return;  // layout already shows latest balances via buildLayout()
+      }
 
-      // Profile block — shop/area/district/status for quick at-a-glance context
-      const profileBlock = `
-        <div class="card" style="margin-bottom:1rem;">
-          <h2>Agent Profile</h2>
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem 1.25rem;font-size:0.9rem;">
-            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Agent ID</div><div><code>${DASH.escapeHtml(p.agent_id || a.agent_id)}</code></div></div>
-            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Shop</div><div>${DASH.escapeHtml(headerShop)}</div></div>
-            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Area</div><div>${DASH.escapeHtml(headerArea)}</div></div>
-            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">District</div><div>${DASH.escapeHtml(headerDist)}</div></div>
-            <div><div style="color:var(--text-dim);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Status</div><div><span class="pill">${DASH.escapeHtml(p.status || a.status || '—')}</span></div></div>
-          </div>
-        </div>
-      `;
-
-      main.innerHTML = `
-        <h1 class="section-title">Agent View <small>${DASH.escapeHtml(headerShop)} · ${DASH.escapeHtml(headerArea)}, ${DASH.escapeHtml(headerDist)}</small></h1>
-        ${profileBlock}
-        <div class="grid cols-4">${balanceCards}</div>
-        <div class="grid cols-2" style="margin-top:1rem;">
-          <div class="card">
-            <h2>Recent Transactions <small style="color:var(--text-dim);font-weight:400;">Last 15</small></h2>
-            ${data.recent_transactions.length === 0
-              ? `<div class="empty">No recent transactions.</div>`
-              : `<table><thead><tr><th>Time</th><th>Provider</th><th>Type</th><th style="text-align:right;">Amount</th><th>Customer Hash</th></tr></thead><tbody>${txns}</tbody></table>`}
-          </div>
-          <div class="card">
-            <h2>Active Alerts <small style="color:var(--text-dim);font-weight:400;">${data.alerts.length}</small></h2>
-            ${alerts}
-          </div>
-        </div>
-      `;
+      // ----- Partial update path (steady-state polling) -----
+      // Update only the sim chip fields, balance numbers, and prepend
+      // any newly arrived txns / alerts. NO full DOM repaint.
+      updateBalances(data);
+      if (simRunning) {
+        updateSimStatusChip(simState.sim || {});
+        const newTxns   = allTxns.filter(t => !seenTxnIds.has(t.tx_id));
+        const newAlerts = allAlerts.filter(a => !seenAlertIds.has(a.alert_id));
+        appendNewTransactions(newTxns);
+        appendNewAlerts(newAlerts);
+        // Mark these as seen (applyBatch may have skipped them if no provider_id)
+        for (const t of allTxns) seenTxnIds.add(t.tx_id);
+        for (const a of allAlerts) seenAlertIds.add(a.alert_id);
+      }
     } catch (e) {
-      main.innerHTML = `<div class="error-banner">Error: ${DASH.escapeHtml(e.message)}</div>`;
+      // Show error banner in-place without nuking the layout.
+      const existing = document.getElementById('content');
+      const banner = document.createElement('div');
+      banner.className = 'error-banner';
+      banner.textContent = `Error: ${e.message}`;
+      // Prepend banner — keep existing nodes underneath.
+      if (existing && existing.firstChild) existing.insertBefore(banner, existing.firstChild);
+      else if (existing) existing.innerHTML = `<div class="error-banner">Error: ${e.message}</div>`;
+      setTimeout(() => banner.remove(), 4000);
+    }
+  }
+
+  // ---------- Simulation control ----------
+  let simState = { running: false, sim: null };
+
+  async function pollSimStatus() {
+    try {
+      const aid = JSON_PROFILE && JSON_PROFILE.profile && JSON_PROFILE.profile.agent_id;
+      const url = aid ? `/api/simulate/status?agent_id=${encodeURIComponent(aid)}` : '/api/simulate/status';
+      const r = await fetch(url);
+      const j = await r.json();
+      simState.running = !!j.running;
+      simState.sim = j.sim || null;
+    } catch (e) {
+      // Network blip — keep last known state.
+    }
+  }
+
+  async function startSimulation() {
+    const sel = document.getElementById('sim-window-select');
+    const win = parseInt(sel.value, 10);
+    const btn = document.getElementById('start-sim-btn');
+    btn.disabled = true;
+    btn.textContent = 'Starting…';
+    try {
+      const aid = JSON_PROFILE.profile.agent_id;
+      const r = await fetch('/api/simulate/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ agent_id: aid, window_minutes: win }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || `HTTP ${r.status}`);
+      }
+      const j = await r.json();
+      DASH.toast(`Simulation started (${win} min window)`, 'success');
+      simState.running = true;
+      simState.sim = j;
+      // Reset client-side ledgers so the new sim drains from a clean baseline.
+      liveCash.reset();
+      liveWallet.reset();
+      seenTxnIds.clear();
+      seenAlertIds.clear();
+      lastSimRunning = false;  // force layout rebuild on next render
+      render();
+    } catch (e) {
+      DASH.toast(e.message || 'Failed to start', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Start Simulation';
     }
   }
 
   document.getElementById('refresh-btn').addEventListener('click', render);
-  document.getElementById('reset-sim-btn').addEventListener('click', () => {
-    liveCash.reset();
-    liveWallet.reset();
-    DASH.toast('Sim reset — all ledgers back to starting balances', 'success');
-    render();
+  document.getElementById('reset-sim-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('reset-sim-btn');
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '↺ Resetting…';
+    try {
+      // Hit the server-side reset so the DB columns AND the simlive_ txn
+      // log both revert to the JSON-seed baseline. After it returns, the
+      // very next render will fetch clean balances (no deductions, no
+      // count, direction=STABLE on all cards).
+      const aid = JSON_PROFILE && JSON_PROFILE.profile && JSON_PROFILE.profile.agent_id;
+      const r = await fetch('/api/simulate/reset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ agent_id: aid || '' }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || `HTTP ${r.status}`);
+      }
+      // Reset client-side dedup sets so the rebuild can re-render cleanly.
+      seenTxnIds.clear();
+      seenAlertIds.clear();
+      lastSimRunning = false;
+      DASH.toast('Reset — balances and sim activity restored to seed', 'success');
+      // Trigger a full layout rebuild on next render (sim state re-evaluated).
+      render();
+    } catch (e) {
+      DASH.toast(e.message || 'Reset failed', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
   });
   render();
   // Poll every 5s — fast enough to feel live, cheap enough for the demo.

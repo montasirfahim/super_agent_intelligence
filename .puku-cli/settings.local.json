@@ -16,7 +16,8 @@
       "Bash(curl -s -X POST -H \"Content-Type: application/json\" -d '{\"\"\"\"role\"\"\"\":\"\"\"\"agent\"\"\"\",\"\"\"\"username\"\"\"\":\"\"\"\"agent.bka.dha.1.01\"\"\"\",\"\"\"\"password\"\"\"\":\"\"\"\"wrong\"\"\"\"}' http://127.0.0.1:8000/api/login)",
       "Bash(cd /d \"D:\\\\super_agent_intelligence\")",
       "Bash(taskkill //PID 17068 //F 2)",
-      "Bash(1 sleep:*)"
+      "Bash(1 sleep:*)",
+      "Bash(wc:*)"
     ]
   }
 }

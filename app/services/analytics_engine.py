@@ -6,6 +6,29 @@ to build `Alert` and `Ticket` ORM rows. This module is purely computational
 plus ORM reads — it does NOT write to the database. Ticket creation and the
 initial AuditLog row live in the orchestration layer.
 
+DATA SOURCES
+============
+
+The engine uses TWO data sources, kept strictly separate:
+
+1. `base_dataset.json` (file) — the CANONICAL historical reference.
+   - All baseline / historical burn-rate samples come from here.
+   - Per-customer history baseline (median amount, MAD, sigma) comes from here.
+   - Cold-start fallback (area-pooled peers) uses data from here.
+   - Loaded once per process and cached with `@lru_cache`.
+
+2. Live Postgres DB — used ONLY for the rolling-window simulation stream.
+   - The last 5/10/30 minutes of transactions (so the engine reacts to the demo).
+   - Current wallet / shared-cash balances.
+   - The simulation script writes new transactions here when the user clicks
+     "Start Simulation" — those rows are what we compare against the JSON
+     baseline to surface anomalies.
+
+Why split? The JSON holds days/weeks of historical data that the demo's
+short sim window can't reproduce. Comparing a 30-minute sim stream to the
+last 14-30 days of historical patterns is what makes the velocity z-score,
+structuring, and cross-provider correlation signals meaningful.
+
 Money handling: every monetary value is `decimal.Decimal` end-to-end. We
 only cast to `float` for ratio-like intermediates (z-scores, sigma spreads)
 that are inherently non-monetary, and only at the point of computation.
@@ -22,7 +45,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlmodel import Session, select
 
@@ -35,6 +60,61 @@ from app.services.routing import route_to_officer  # used in build_ticket
 
 
 # ---------------------------------------------------------------------------
+# base_dataset.json loader + helpers (cached per process)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_base_dataset() -> dict:
+    """Load and cache the static JSON dataset once per process.
+
+    `base_dataset.json` sits at the repo root and is the canonical
+    reference for agent identities, area assignments, wallet starting
+    balances, and the historical `transactions-stream` that the engine
+    uses for baseline + per-customer history.
+    """
+    path = Path(__file__).resolve().parent.parent.parent / "base_dataset.json"
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _json_transactions() -> List[Dict[str, Any]]:
+    """All historical transactions from the JSON, as raw dicts."""
+    return _load_base_dataset().get("transactions-stream", [])
+
+
+def _json_agents() -> List[Dict[str, Any]]:
+    return _load_base_dataset().get("agent", [])
+
+
+def _json_provider_wallets() -> List[Dict[str, Any]]:
+    return _load_base_dataset().get("providerwallet", [])
+
+
+def _parse_json_timestamp(ts: str) -> datetime:
+    """Parse the JSON's naive ISO timestamp.
+
+    JSON timestamps look like "2026-06-11T09:30:00" — naive, Asia/Dhaka.
+    """
+    return datetime.fromisoformat(ts)
+
+
+def _agent_area_from_json(agent_id: str) -> Optional[str]:
+    for a in _json_agents():
+        if a.get("agent_id") == agent_id:
+            return a.get("area")
+    return None
+
+
+# JSON uses friendly provider names ("bkash", "nagad", "rocket"); the live
+# DB stores them as numeric ids ("1", "2", "3"). Both maps are needed so
+# the JSON filter (which keys on friendly names) accepts either form, and
+# the provider-list helper (which feeds the live wallet lookups) emits
+# DB-form ids.
+_PROVIDER_NAME_TO_ID = {"bkash": "1", "nagad": "2", "rocket": "3"}
+_PROVIDER_ID_TO_NAME = {"1": "bkash", "2": "nagad", "3": "rocket"}
+
+
+# ---------------------------------------------------------------------------
 # Config (named constants — never inline literals)
 # ---------------------------------------------------------------------------
 
@@ -43,7 +123,7 @@ SOURCE_TZ = "Asia/Dhaka"          # documented assumption for naive timestamps
 WINDOW_WEIGHTS: Dict[int, Decimal] = {5: Decimal("0.5"), 10: Decimal("0.3"), 30: Decimal("0.2")}
 
 MIN_BASELINE_SAMPLES = 5
-BASELINE_LOOKBACK_DAYS = 14      # N historical days for the baseline window
+BASELINE_LOOKBACK_DAYS = 30      # historical days for the baseline window
 EPSILON = Decimal("0.000001")
 
 SAFETY_FLOOR = Decimal("0")
@@ -109,7 +189,7 @@ def _to_event(row: TransactionStream) -> TransactionEvent:
 
 
 # ---------------------------------------------------------------------------
-# Data access adapters (replace the prompt's NotImplementedError stubs)
+# Live-DB adapters (rolling-window sim stream + current balances)
 # ---------------------------------------------------------------------------
 
 def get_transactions(
@@ -119,9 +199,11 @@ def get_transactions(
     start: datetime,
     end: datetime,
 ) -> List[TransactionEvent]:
-    """Pull transactions for one agent, optionally filtered to a provider.
+    """Pull LIVE transactions for one agent from the rolling window.
 
-    `provider_id=None` aggregates across all providers (used for shared cash).
+    Reads from the live Postgres DB — this is the simulation stream that
+    grows while the demo is running. Historical baseline data does NOT
+    come from here; that comes from `base_dataset.json`.
     """
     stmt = (
         select(TransactionStream)
@@ -168,22 +250,23 @@ def get_agent(db: Session, agent_id: str) -> AgentRecord:
 
 
 def _list_distinct_providers(db: Session, agent_id: str) -> List[str]:
-    """Providers this agent has any transactions on (from the last 30 days).
+    """Providers this agent has any historical transactions on.
 
-    Used by `analyze()` when callers don't pass a provider list.
+    Source: `base_dataset.json` (canonical reference). The DB provider.id
+    is "1"/"2"/"3"; JSON uses friendly names "bkash"/"nagad"/"rocket" —
+    we normalize to DB form so downstream wallet lookups work.
     """
-    cutoff = datetime.utcnow() - timedelta(days=30)
-    rows = db.exec(
-        select(TransactionStream.provider_id)
-        .where(TransactionStream.agent_id == agent_id)
-        .where(TransactionStream.timestamp >= cutoff)
-        .distinct()
-    ).all()
-    return sorted({r for r in rows if r})
+    raw = {
+        tx.get("provider_id")
+        for tx in _json_transactions()
+        if tx.get("agent_id") == agent_id and tx.get("provider_id")
+    }
+    normalized = {_PROVIDER_NAME_TO_ID.get(p, p) for p in raw}
+    return sorted(normalized)
 
 
 # ---------------------------------------------------------------------------
-# Historical baseline sample extractors
+# Historical baseline sample extractors — ALL read from base_dataset.json
 # ---------------------------------------------------------------------------
 
 def _hour_bucket(dt: datetime) -> int:
@@ -193,18 +276,52 @@ def _hour_bucket(dt: datetime) -> int:
 def _day_type(dt: datetime) -> str:
     """Simplified day-type classifier.
 
-    The full platform has a config-driven calendar; for the analytics engine
-    we treat:
-      - weekday 0..4 → "weekday"
-      - weekday 5..6 → "weekend"
-    Pay-day / pre-eid tags come from the `tx_day` column on TransactionStream
-    itself when present (handled in the historical sample fetch below).
+    Treats weekday 0..4 → "weekday", 5..6 → "weekend". The full platform
+    may have a richer calendar (pay-day / Eid-eve tags live on the
+    TransactionStream.tx_day column for the live stream; the JSON dataset
+    doesn't carry those).
     """
     return "weekend" if dt.weekday() >= 5 else "weekday"
 
 
+def _filter_json_txns(
+    agent_id: str,
+    provider_id: Optional[str],
+    start: datetime,
+    end: datetime,
+    customer_id_hash: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Pull historical transactions from base_dataset.json that match.
+
+    All filters are AND'd. `provider_id=None` ignores the provider filter
+    (used for shared cash). `customer_id_hash=None` ignores the customer
+    filter (used for baseline; set it for per-customer history).
+
+    `provider_id` may be either DB form ("1"/"2"/"3") or JSON form
+    ("bkash"/"nagad"/"rocket"); both are accepted because callers upstream
+    (compute_baseline, _pool_area_samples, customer_history_baseline) pass
+    DB-form IDs but the JSON's canonical key is the friendly name.
+    """
+    json_provider = _PROVIDER_ID_TO_NAME.get(provider_id, provider_id)
+    matches: List[Dict[str, Any]] = []
+    for tx in _json_transactions():
+        if tx.get("agent_id") != agent_id:
+            continue
+        if provider_id is not None and tx.get("provider_id") != json_provider:
+            continue
+        if customer_id_hash is not None and tx.get("customer_id_hash") != customer_id_hash:
+            continue
+        try:
+            ts = _parse_json_timestamp(tx["timestamp"])
+        except (KeyError, ValueError):
+            continue
+        if not (start <= ts <= end):
+            continue
+        matches.append(tx)
+    return matches
+
+
 def _get_historical_samples(
-    db: Session,
     agent_id: str,
     provider_id: Optional[str],
     t: datetime,
@@ -212,50 +329,111 @@ def _get_historical_samples(
 ) -> List[Decimal]:
     """Per-window burn-rate samples (BDT/min) over the last `BASELINE_LOOKBACK_DAYS`.
 
-    For each historical day in the lookback window, compute the burn rate
-    for the same hour bucket + day type as `t`, using transactions whose
-    timestamp falls in that bucket. Returns a list of Decimal samples
-    (one per day that had any activity).
+    Strategy (broadest → tightest):
+      1. Same-hour + same-day-type for the last 30 days (most specific).
+      2. If < MIN_BASELINE_SAMPLES found, fall back to any day in the
+         lookback window regardless of day-type. The JSON dataset doesn't
+         span every calendar day, so a strict Sunday-only search on a
+         dataset that has zero Sundays would yield zero samples — the
+         broader fallback rescues those cases.
+
+    Source: `base_dataset.json` (NEVER the live DB).
     """
-    end = t - timedelta(minutes=window)
     hour = _hour_bucket(t)
     day_type = _day_type(t)
-    samples: List[Decimal] = []
+    samples = _collect_burn_samples(agent_id, provider_id, t,
+                                    hour=hour, day_type=day_type)
+    if len(samples) < MIN_BASELINE_SAMPLES:
+        samples = _collect_burn_samples(agent_id, provider_id, t,
+                                        hour=None, day_type=None)
+    return samples
 
+
+def _collect_burn_samples(
+    agent_id: str,
+    provider_id: Optional[str],
+    t: datetime,
+    hour: Optional[int],
+    day_type: Optional[str],
+) -> List[Decimal]:
+    """Inner loop for `_get_historical_samples` — one sample per matched day."""
+    samples: List[Decimal] = []
     for d in range(BASELINE_LOOKBACK_DAYS):
-        day_start = (t - timedelta(days=d + 1)).replace(hour=hour, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(hours=1)
-        # Only include days whose day-type matches `t`
-        if _day_type(day_start) != day_type:
+        if hour is not None:
+            day_start = (t - timedelta(days=d + 1)).replace(
+                hour=hour, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(hours=1)
+        else:
+            day_start = (t - timedelta(days=d + 1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(days=1)
+        if day_type is not None and _day_type(day_start) != day_type:
             continue
-        txs = get_transactions(db, agent_id, provider_id, day_start, day_end)
-        cash_out = sum((tx.amount for tx in txs if tx.tx_type == TxType.CASH_OUT), Decimal("0"))
-        cash_in = sum((tx.amount for tx in txs if tx.tx_type == TxType.CASH_IN), Decimal("0"))
+        txs = _filter_json_txns(agent_id, provider_id, day_start, day_end)
+        cash_out = sum(
+            (Decimal(tx["amount"]) for tx in txs if tx.get("tx_type") == "CASH_OUT"),
+            Decimal("0"),
+        )
+        cash_in = sum(
+            (Decimal(tx["amount"]) for tx in txs if tx.get("tx_type") == "CASH_IN"),
+            Decimal("0"),
+        )
         if (cash_out + cash_in) == 0:
             continue
-        samples.append((cash_out - cash_in) / Decimal(window))
+        span_minutes = (day_end - day_start).total_seconds() / 60.0
+        if span_minutes <= 0:
+            continue
+        samples.append((cash_out - cash_in) / Decimal(str(span_minutes)))
     return samples
 
 
 def _get_historical_count_samples(
-    db: Session,
     agent_id: str,
     provider_id: Optional[str],
     t: datetime,
     window: int,
 ) -> List[int]:
-    """Per-window transaction-count samples over the same historical lookback."""
-    end = t - timedelta(minutes=window)
+    """Per-window transaction-count samples over the same historical lookback.
+
+    Mirrors `_get_historical_samples`: tries same-hour + same-day-type
+    first, then broadens to any-day-in-lookback if too thin.
+
+    Source: `base_dataset.json`.
+    """
     hour = _hour_bucket(t)
     day_type = _day_type(t)
-    counts: List[int] = []
+    counts = _collect_count_samples(agent_id, provider_id, t,
+                                    hour=hour, day_type=day_type)
+    if len(counts) < MIN_BASELINE_SAMPLES:
+        counts = _collect_count_samples(agent_id, provider_id, t,
+                                        hour=None, day_type=None)
+    return counts
 
+
+def _collect_count_samples(
+    agent_id: str,
+    provider_id: Optional[str],
+    t: datetime,
+    hour: Optional[int],
+    day_type: Optional[str],
+) -> List[int]:
+    counts: List[int] = []
     for d in range(BASELINE_LOOKBACK_DAYS):
-        day_start = (t - timedelta(days=d + 1)).replace(hour=hour, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(hours=1)
-        if _day_type(day_start) != day_type:
+        if hour is not None:
+            day_start = (t - timedelta(days=d + 1)).replace(
+                hour=hour, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(hours=1)
+        else:
+            day_start = (t - timedelta(days=d + 1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(days=1)
+        if day_type is not None and _day_type(day_start) != day_type:
             continue
-        txs = get_transactions(db, agent_id, provider_id, day_start, day_end)
+        txs = _filter_json_txns(agent_id, provider_id, day_start, day_end)
         if not txs:
             continue
         counts.append(len(txs))
@@ -263,19 +441,144 @@ def _get_historical_count_samples(
 
 
 # ---------------------------------------------------------------------------
-# Routing shim — `build_ticket` is exported as a dict-builder and is called
-# by orchestration code that already holds a `db` session, but the ticket
-# payload only carries `agent_id`/`provider_id`. We resolve the session
-# lazily via SQLModel's engine bound to the global `database.engine`.
+# Per-customer history (uses `customer_id_hash` from JSON)
+# ---------------------------------------------------------------------------
+
+def customer_history_baseline(
+    agent_id: str,
+    provider_id: str,
+    customer_id_hash: str,
+    t: datetime,
+) -> Dict[str, Any]:
+    """Per-customer historical baseline from base_dataset.json.
+
+    Returns median amount, MAD, sigma_amount, tx_count, baseline_source.
+    If the customer has < 3 historical txns, baseline is too thin —
+    baseline_source="insufficient" and downstream callers should fall
+    back to agent-wide norms.
+    """
+    CUSTOMER_MIN = 3
+    txs = _filter_json_txns(
+        agent_id=agent_id,
+        provider_id=provider_id,
+        start=datetime(2000, 1, 1),
+        end=t,
+        customer_id_hash=customer_id_hash,
+    )
+    if len(txs) < CUSTOMER_MIN:
+        return {
+            "median_amount": Decimal("0"),
+            "mad_amount": Decimal("0"),
+            "tx_count": len(txs),
+            "baseline_source": "insufficient",
+        }
+    amounts = [Decimal(tx["amount"]) for tx in txs]
+    median_amt = _decimal_median(amounts)
+    mad_amt = _decimal_median([abs(x - median_amt) for x in amounts])
+    return {
+        "median_amount": median_amt,
+        "mad_amount": mad_amt,
+        "sigma_amount": Decimal("1.4826") * mad_amt,
+        "tx_count": len(txs),
+        "baseline_source": "agent",  # "agent" here means per-customer
+    }
+
+
+def detect_customer_anomaly(
+    db: Session,
+    agent_id: str,
+    provider_id: str,
+    customer_id_hash: str,
+    t: datetime,
+) -> Dict[str, Any]:
+    """Per-customer anomaly detection.
+
+    Compares this customer's RECENT behavior (last 30 min, from the live DB
+    so we catch freshly-injected sim rows) against their OWN historical
+    baseline (from the JSON). Flags if amount z-score exceeds 3.0.
+
+    Returns:
+        {
+            "customer_id_hash": str,
+            "amount_z": float,
+            "anomaly": bool,
+            "baseline_source": "agent"|"insufficient",
+            "historical_tx_count": int,
+        }
+    """
+    base = customer_history_baseline(agent_id, provider_id, customer_id_hash, t)
+    if base["baseline_source"] == "insufficient":
+        return {
+            "customer_id_hash": customer_id_hash,
+            "amount_z": 0.0,
+            "anomaly": False,
+            "baseline_source": "insufficient",
+            "historical_tx_count": base["tx_count"],
+        }
+
+    cutoff = t - timedelta(minutes=30)
+    recent = db.exec(
+        select(TransactionStream)
+        .where(TransactionStream.agent_id == agent_id)
+        .where(TransactionStream.provider_id == provider_id)
+        .where(TransactionStream.customer_id_hash == customer_id_hash)
+        .where(TransactionStream.timestamp >= cutoff)
+    ).all()
+    if not recent:
+        return {
+            "customer_id_hash": customer_id_hash,
+            "amount_z": 0.0,
+            "anomaly": False,
+            "baseline_source": "agent",
+            "historical_tx_count": base["tx_count"],
+        }
+
+    avg_recent = sum(Decimal(t.amount) for t in recent) / Decimal(len(recent))
+    sigma = max(base["sigma_amount"], EPSILON)
+    amount_z = float((avg_recent - base["median_amount"]) / sigma)
+    return {
+        "customer_id_hash": customer_id_hash,
+        "amount_z": amount_z,
+        "anomaly": abs(amount_z) > Z_THRESHOLD,
+        "baseline_source": "agent",
+        "historical_tx_count": base["tx_count"],
+    }
+
+
+def detect_customer_anomalies_for_provider(
+    db: Session,
+    agent_id: str,
+    provider_id: str,
+    t: datetime,
+) -> List[Dict[str, Any]]:
+    """Run detect_customer_anomaly for every customer active on this provider.
+
+    Returns the list of per-customer results. Caller can filter for
+    `anomaly=True` to get the flagged customers.
+    """
+    cutoff = t - timedelta(minutes=30)
+    rows = db.exec(
+        select(TransactionStream.customer_id_hash)
+        .where(TransactionStream.agent_id == agent_id)
+        .where(TransactionStream.provider_id == provider_id)
+        .where(TransactionStream.timestamp >= cutoff)
+        .distinct()
+    ).all()
+    customers = [r for r in rows if r]
+    return [
+        detect_customer_anomaly(db, agent_id, provider_id, c, t)
+        for c in customers
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Routing shim — `build_ticket` is called by orchestration code that
+# already holds a `db` session, but the ticket payload only carries
+# `agent_id`/`provider_id`. We resolve the session lazily.
 # ---------------------------------------------------------------------------
 
 def _route_to_officer_for_ticket(agent_id: str, provider_id: str) -> str:
-    """Best-effort officer lookup at ticket-build time.
-
-    Looks up via the active FastAPI request's session if one is bound,
-    otherwise via a fresh short-lived session against the global engine.
-    Returns the officer id (or "" if no assignment can be found).
-    """
+    """Best-effort officer lookup at ticket-build time."""
     from app.database import engine
     try:
         with Session(engine) as s:
@@ -285,7 +588,7 @@ def _route_to_officer_for_ticket(agent_id: str, provider_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Rolling-window burn rate
+# Rolling-window burn rate (LIVE DB only — the simulation stream)
 # ---------------------------------------------------------------------------
 
 def compute_burn_rate(
@@ -295,6 +598,11 @@ def compute_burn_rate(
     t: datetime,
 ) -> Dict[str, Any]:
     """Formula: `burn_rate(w) = (cash_out - cash_in) / w` per window in {5,10,30}.
+
+    Reads the LAST `w` MINUTES of transactions from the live DB. This is
+    the "now" stream that the demo grows while the simulation is running.
+    Historical baseline comparison is done by `compute_baseline`, which
+    reads from JSON.
 
     `provider_id=None` aggregates across all providers for the shared drawer.
     """
@@ -314,7 +622,7 @@ def compute_burn_rate(
 
 
 # ---------------------------------------------------------------------------
-# Historical baseline (median / MAD → sigma)
+# Historical baseline (median / MAD → sigma) — JSON source only
 # ---------------------------------------------------------------------------
 
 def compute_baseline(
@@ -324,20 +632,24 @@ def compute_baseline(
     t: datetime,
     window: int,
 ) -> Dict[str, Any]:
-    """Robust baseline: median + MAD-derived sigma, with agent→area pooled fallback.
+    """Robust baseline from base_dataset.json: median + MAD → sigma.
 
-    Returns Decimal throughout. The Decimal/float mixing that the previous
-    implementation suffered from is fixed: we compute the median and MAD as
-    Decimal, then derive sigma via the 1.4826 constant also as Decimal.
+    Returns Decimal throughout. If the agent has < MIN_BASELINE_SAMPLES
+    days of data, falls back to pooling every agent in the same area
+    (still JSON-sourced). If that's also too thin, baseline_source =
+    "insufficient" and median/sigma are zero (caller treats that as a
+    cold-start signal — never as a positive anomaly).
+
+    The `db` parameter is kept on the signature for API compatibility
+    but is NOT used — baseline data comes exclusively from JSON.
     """
-    samples = _get_historical_samples(db, agent_id, provider_id, t, window)
-    count_samples = _get_historical_count_samples(db, agent_id, provider_id, t, window)
+    samples = _get_historical_samples(agent_id, provider_id, t, window)
+    count_samples = _get_historical_count_samples(agent_id, provider_id, t, window)
 
     source = "agent"
     if len(samples) < MIN_BASELINE_SAMPLES:
-        # Real fallback: pool across all agents in the same area.
         samples, count_samples = _pool_area_samples(
-            db, agent_id, provider_id, t, window
+            agent_id, provider_id, t, window
         )
         source = "pooled"
         if len(samples) < MIN_BASELINE_SAMPLES:
@@ -373,7 +685,6 @@ def compute_baseline(
 
 
 def _pool_area_samples(
-    db: Session,
     agent_id: str,
     provider_id: Optional[str],
     t: datetime,
@@ -382,20 +693,21 @@ def _pool_area_samples(
     """Pool historical samples across every agent in the same area as `agent_id`.
 
     Returns (burn_rate_samples, count_samples). Used as a cold-start fallback
-    when the per-agent sample count is below `MIN_BASELINE_SAMPLES`.
+    when the per-agent sample count is below `MIN_BASELINE_SAMPLES`. Reads
+    from `base_dataset.json` (the canonical data source for the engine).
     """
-    agent = db.get(Agent, agent_id)
-    if not agent:
+    area = _agent_area_from_json(agent_id)
+    if not area:
         return [], []
-    area = agent.area
-    peers = db.exec(select(Agent).where(Agent.area == area)).all()
     burn: List[Decimal] = []
     counts: List[int] = []
-    for peer in peers:
-        if peer.agent_id == agent_id:
+    for peer in _json_agents():
+        if peer.get("area") != area:
             continue
-        burn.extend(_get_historical_samples(db, peer.agent_id, provider_id, t, window))
-        counts.extend(_get_historical_count_samples(db, peer.agent_id, provider_id, t, window))
+        if peer.get("agent_id") == agent_id:
+            continue
+        burn.extend(_get_historical_samples(peer["agent_id"], provider_id, t, window))
+        counts.extend(_get_historical_count_samples(peer["agent_id"], provider_id, t, window))
     return burn, counts
 
 
@@ -421,7 +733,13 @@ def predict_shortage(
     provider_id: Optional[str],
     t: datetime,
 ) -> Dict[str, Any]:
-    """Section 4 of the prompt: ETA + confidence band + change_pct."""
+    """Section 4 of the prompt: ETA + confidence band + change_pct.
+
+    Combines:
+      - LIVE rolling burn rate (from the DB)
+      - JSON-sourced baseline (historical median, MAD-derived sigma)
+      - LIVE current balance (from the DB)
+    """
     burn_data = compute_burn_rate(db, agent_id, provider_id, t)
     weighted: Decimal = burn_data["burn_rate_weighted"]
     rates: Dict[int, Decimal] = burn_data["burn_rates"]
@@ -444,8 +762,6 @@ def predict_shortage(
         }
 
     current_balance = _get_balance(db, agent_id, provider_id)
-    # stdev needs ≥2 points; with all three window rates equal the spread is
-    # genuinely 0, not an error. Use a guarded wrapper.
     rate_floats = [float(rates[w]) for w in WINDOW_WEIGHTS]
     sigma_burn = Decimal(
         str(statistics.stdev(rate_floats)) if len(rate_floats) >= 2 else 0.0
@@ -502,12 +818,6 @@ def _balance_str(db: Session, agent_id: str, provider_id: Optional[str]) -> str:
 #   topup_amount        = (raw_topup * (1 + safety_margin))
 #                            .quantize(Decimal("100"), rounding=ROUND_HALF_UP)
 #   Return Decimal("0") if raw_topup == 0
-#
-# The prompt specifies the function takes the *already-computed* triplet
-# (weighted_burn, current_balance, relative_uncertainty) — it does NOT
-# re-query the DB. We honor that with `recommend_topup_amount` below, and
-# keep `recommend_topup` as a thin convenience wrapper that derives the
-# triplet from `predict_shortage` for callers that don't have one in scope.
 # ---------------------------------------------------------------------------
 
 def recommend_topup_amount(
@@ -515,12 +825,7 @@ def recommend_topup_amount(
     current_balance: Decimal,
     relative_uncertainty: float = 0.0,
 ) -> Decimal:
-    """Pure step-5 formula. No DB, no Decimal→float on money, no string parsing.
-
-    Returns the top-up amount as Decimal, already rounded to the nearest
-    ৳100 with the safety margin applied. Returns Decimal("0") if no top-up
-    is needed (raw_topup == 0).
-    """
+    """Pure step-5 formula. No DB, no Decimal→float on money."""
     required = Decimal(weighted_burn) * Decimal(TARGET_COVERAGE_MINUTES)
     raw_topup = max(Decimal("0"), required - Decimal(current_balance))
     if raw_topup == Decimal("0"):
@@ -543,8 +848,7 @@ def recommend_topup(
 
     Derives (weighted_burn, current_balance, relative_uncertainty) from
     `predict_shortage` and returns the same dict shape the platform already
-    consumes:
-        {"amount": "39600.00", "target_coverage_minutes": 60}
+    consumes: `{"amount": "...", "target_coverage_minutes": 60}`.
 
     Safe for missing-wallet providers: returns Decimal("0") instead of
     raising KeyError so the upstream `analyze()` doesn't crash mid-flight.
@@ -552,16 +856,12 @@ def recommend_topup(
     try:
         pred = predict_shortage(db, agent_id, provider_id, t)
         weighted_burn = Decimal(pred["burn_rate_weighted"])
-        # current_balance comes from the live prediction; if it's missing or
-        # zero (no wallet), fall back to a direct lookup so we can still
-        # report a meaningful top-up against the actual stored balance.
         try:
             current_balance = _get_balance(db, agent_id, provider_id)
         except KeyError:
             current_balance = Decimal(pred.get("current_balance") or "0")
         relative_uncertainty = float(pred.get("relative_uncertainty", 0.0))
     except KeyError:
-        # Agent or provider not found — no top-up to recommend.
         return {"amount": "0.00", "target_coverage_minutes": TARGET_COVERAGE_MINUTES}
 
     amount = recommend_topup_amount(
@@ -576,7 +876,7 @@ def recommend_topup(
 
 
 # ---------------------------------------------------------------------------
-# Velocity anomaly
+# Velocity anomaly — compares LIVE rolling burn vs JSON baseline
 # ---------------------------------------------------------------------------
 
 def detect_velocity_anomaly(
@@ -585,7 +885,11 @@ def detect_velocity_anomaly(
     provider_id: str,
     t: datetime,
 ) -> Dict[str, Any]:
-    """Section 6a: count_z + amount_z averaged, flag if any window > Z_THRESHOLD."""
+    """Section 6a: count_z + amount_z averaged, flag if any window > Z_THRESHOLD.
+
+    The LIVE rolling count + burn rate come from the DB; the baseline
+    median/sigma come from `base_dataset.json` (via compute_baseline).
+    """
     burn_data = compute_burn_rate(db, agent_id, provider_id, t)
     rates = burn_data["burn_rates"]
 
@@ -619,7 +923,7 @@ def detect_velocity_anomaly(
 
 
 # ---------------------------------------------------------------------------
-# Structuring / near-duplicate pattern
+# Structuring / near-duplicate pattern (LIVE 15-min CASH_OUT cluster)
 # ---------------------------------------------------------------------------
 
 def same_cluster(a: Decimal, b: Decimal, tolerance: Decimal = STRUCTURING_TOLERANCE) -> bool:
@@ -634,7 +938,12 @@ def detect_structuring(
     provider_id: str,
     t: datetime,
 ) -> Dict[str, Any]:
-    """Section 6b: 15-min window, CASH_OUT only, cluster by amount similarity."""
+    """Section 6b: 15-min window, CASH_OUT only, cluster by amount similarity.
+
+    Operates on the LIVE 15-min rolling stream — historical transactions
+    in the JSON aren't part of structuring detection (that's a present-tense
+    operational signal).
+    """
     start = t - timedelta(minutes=STRUCTURING_WINDOW_MINS)
     txs = get_transactions(db, agent_id, provider_id, start, t)
     out_txs = sorted([tx for tx in txs if tx.tx_type == TxType.CASH_OUT], key=lambda x: x.amount)
@@ -643,9 +952,6 @@ def detect_structuring(
     if n_total == 0:
         return {"structuring_anomaly": False, "structuring_ratio": 0.0, "flagged_customers": []}
 
-    # Robust greedy grouping: compare each new tx against the running mean of
-    # the current cluster, not just the previous amount. A single in-band
-    # outlier no longer breaks an otherwise valid cluster.
     clusters: List[List[TransactionEvent]] = []
     current: List[TransactionEvent] = []
     for tx in out_txs:
@@ -705,7 +1011,7 @@ def detect_cross_provider_correlation(
 
 
 # ---------------------------------------------------------------------------
-# Balance reconciliation (data-quality signal)
+# Balance reconciliation (data-quality signal — LIVE DB only)
 # ---------------------------------------------------------------------------
 
 def check_balance_reconciliation(
@@ -714,14 +1020,7 @@ def check_balance_reconciliation(
     provider_id: Optional[str],
     t: datetime,
 ) -> Dict[str, Any]:
-    """Section 6d: |reported - (opening + in - out)| / reported > tolerance → DQ flag.
-
-    Without a stable opening-balance table, we use the agent's stored
-    `shared_physical_cash` (or wallet `e_money_balance`) as the "reported"
-    value and the day's transactions as the reconciliation period. This
-    surfaces cases where the DB balance has drifted far from what the live
-    txn stream implies.
-    """
+    """Section 6d: |reported - (opening + in - out)| / reported > tolerance → DQ flag."""
     try:
         reported = _get_balance(db, agent_id, provider_id)
     except KeyError:
@@ -732,15 +1031,9 @@ def check_balance_reconciliation(
     cash_out = sum((tx.amount for tx in txs if tx.tx_type == TxType.CASH_OUT), Decimal("0"))
     cash_in = sum((tx.amount for tx in txs if tx.tx_type == TxType.CASH_IN), Decimal("0"))
 
-    # Without an opening snapshot we can only flag gross inflows vs the
-    # balance; in this codebase we conservatively report no flag unless the
-    # sum of inflows alone exceeds the reported balance (clearly stale).
     if reported <= Decimal("0"):
         return {"data_quality_flag": False, "reconciliation_error_pct": 0.0}
 
-    # Treat the live simulation source-of-truth as the reconciliation
-    # target: (cash_out - cash_in) should be ≈ reported if reported is
-    # truly the running balance. We surface the percentage.
     net = cash_out - cash_in
     error_pct = float(abs(net) / reported) if reported > 0 else 0.0
     flag = Decimal(str(error_pct)) > RECON_TOLERANCE
@@ -761,7 +1054,12 @@ def analyze(
     t: datetime,
     providers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Top-level entry point. Returns the master evidence dict."""
+    """Top-level entry point. Returns the master evidence dict.
+
+    Reads LIVE data from the DB (rolling burn, structuring window,
+    current balances) and HISTORICAL data from `base_dataset.json`
+    (baseline median/MAD/sigma, per-customer history).
+    """
     if providers is None:
         providers = _list_distinct_providers(db, agent_id)
 
@@ -779,13 +1077,29 @@ def analyze(
         liquidity[p] = predict_shortage(db, agent_id, p, t)
         v_anom = detect_velocity_anomaly(db, agent_id, p, t)
         s_anom = detect_structuring(db, agent_id, p, t)
+        # Per-customer history anomalies: customers whose own amount pattern
+        # has shifted vs their historical baseline. Folded into composite as
+        # an additional weight, and the flagged hashes get surfaced in the
+        # ticket so the officer has a per-customer lead.
+        c_anoms = detect_customer_anomalies_for_provider(db, agent_id, p, t)
+        flagged_by_history = sorted({
+            c["customer_id_hash"]
+            for c in c_anoms
+            if c.get("anomaly") and c.get("baseline_source") == "agent"
+        })
+        merged_flagged = s_anom["flagged_customers"] or flagged_by_history
         anomaly[p] = {
             "velocity_anomaly": v_anom["velocity_anomaly"],
             "velocity_score": v_anom["velocity_score"],
             "triggering_window": v_anom.get("triggering_window"),
             "structuring_anomaly": s_anom["structuring_anomaly"],
             "structuring_ratio": s_anom["structuring_ratio"],
-            "flagged_customers": s_anom["flagged_customers"],
+            "flagged_customers": merged_flagged,
+            "customer_anomaly_count": sum(1 for c in c_anoms if c.get("anomaly")),
+            "customer_anomaly_score": max(
+                (abs(float(c.get("amount_z", 0.0))) for c in c_anoms),
+                default=0.0,
+            ),
         }
 
     corr_data = detect_cross_provider_correlation(db, agent_id, t, providers)
@@ -802,15 +1116,18 @@ def analyze(
             warnings.append("data_quality_issue")
             break
 
-    # Composite score per provider
+    # Composite score per provider (velocity + structuring + customer
+    # history signal + cross-provider correlation).
     for p in providers:
         v_score = anomaly[p]["velocity_score"]
         s_flag = anomaly[p]["structuring_anomaly"]
         s_ratio = anomaly[p]["structuring_ratio"]
+        c_signal = float(anomaly[p].get("customer_anomaly_score", 0.0))
         comp = (
-            0.4 * normalize(v_score)
-            + 0.4 * (float(s_ratio) if s_flag else 0.0)
-            + 0.2 * (1.0 if correlated else 0.0)
+            0.35 * normalize(v_score)
+            + 0.35 * (float(s_ratio) if s_flag else 0.0)
+            + 0.10 * normalize(c_signal)
+            + 0.20 * (1.0 if correlated else 0.0)
         )
         comp = min(comp * multiplier, 1.0)
         # Hard cap: single-provider spike without correlation and without
@@ -848,7 +1165,7 @@ def analyze(
 
 
 # ---------------------------------------------------------------------------
-# Alert + ticket generation
+# Alert + ticket generation — strict per-provider isolation
 # ---------------------------------------------------------------------------
 
 def _new_id() -> str:
@@ -867,7 +1184,7 @@ def derive_alert_type(evidence: Dict[str, Any]) -> str:
     )
     shortage = evidence["liquidity"]["shared_cash"]["eta_minutes"] is not None
     if has_anomaly and shortage:
-        return "BEHAVIORAL_ANOMALY"  # was: COMBINED_LIQUIDITY_ANOMALY (not in ORM enum)
+        return "BEHAVIORAL_ANOMALY"
     if has_anomaly:
         return "BEHAVIORAL_ANOMALY"
     return "LIQUIDITY_SHORTAGE"
@@ -893,7 +1210,7 @@ def determine_responsible_providers(
 ) -> List[str]:
     """A provider is responsible if it tripped any anomaly, is in the correlated
     set, or contributed ≥ 20% of the shared burn in a liquidity-only case."""
-    resp: set[str] = set()
+    resp: set = set()
     total_weighted = Decimal("0")
     for p in providers:
         if evidence["anomaly"][p]["velocity_anomaly"] or evidence["anomaly"][p]["structuring_anomaly"]:
@@ -923,11 +1240,11 @@ def build_ticket(
     Isolation guarantees (each enforced below + by `_assert_no_cross_provider_leak`):
 
       1. `liquidity` is THIS provider's predict-shortage slice. If the upstream
-         `analyze()` didn't produce one for this provider (edge case), we
-         synthesize a zero-filled slice tagged with `provider_id`. We never
-         fall back to `evidence["liquidity"]["shared_cash"]`, because that
-         slice carries the agent's full drawer balance + burn — which means
-         other providers' contributions. That's a multi-tenant leak.
+         `analyze()` didn't produce one for this provider, we synthesize a
+         zero-filled slice tagged with `provider_id`. We never fall back to
+         `evidence["liquidity"]["shared_cash"]`, because that slice carries
+         the agent's full drawer balance + burn — which means other
+         providers' contributions. That's a multi-tenant leak.
       2. `anomaly` / `flagged_customers` are THIS provider's only — never
          aggregated across providers.
       3. `recommended_topup` is the caller-supplied per-provider top-up (see
@@ -939,17 +1256,13 @@ def build_ticket(
       5. `provider_id` is included in the slice so the JS evidence modal can
          label the payload unambiguously.
 
-    `_assert_no_cross_provider_leak` runs at the end of this function and
-    raises `ValueError` if any other provider's id, customer hash, or balance
-    string appears anywhere in the serialized slice. That makes a regression
-    fail loudly instead of silently shipping.
+    `_assert_no_cross_provider_leak` runs at the end and raises ValueError
+    if any other provider's id, customer hash, or balance string appears
+    anywhere in the serialized slice.
     """
     # (1) THIS provider's liquidity slice — never shared cash.
     own_liquidity = evidence["liquidity"].get(provider_id)
     if own_liquidity is None:
-        # Synthesize a zero slice so the ticket is self-contained. Every
-        # numeric field is a stringified Decimal matching the predict_shortage
-        # shape, so JS consumers don't need a special case.
         own_liquidity = {
             "provider_id": provider_id,
             "eta_minutes": None,
@@ -1023,7 +1336,7 @@ def _assert_no_cross_provider_leak(
     Catches:
       - Another provider's customer_id_hash appearing anywhere in the slice
       - Another provider's current_balance digit string (e.g. "38000.00")
-        appearing in liquidity or recommended_topup
+        appearing in recommended_topup or anomaly blocks
       - correlated_with carrying anything other than a list of provider-id
         strings (e.g. a leaked dict or balance)
     """
@@ -1031,7 +1344,6 @@ def _assert_no_cross_provider_leak(
         p for p in evidence.get("anomaly", {}).keys() if p != this_provider
     ]
     if not other_providers:
-        # No peers → nothing to leak. Skip the scan.
         return
 
     serialized = json.dumps(slice_, default=str)
@@ -1045,14 +1357,9 @@ def _assert_no_cross_provider_leak(
                     f"{p!r}'s customer hash {c!r}"
                 )
 
-    # (b) Other providers' current_balance digits must NOT appear in the
-    # recommended_topup or anomaly blocks of this provider's slice. (We
-    # don't check `liquidity.current_balance` itself — that's legitimately
-    # this provider's own number; if another provider happens to have the
-    # same balance, that's coincidence, not a leak.)
-    #
-    # We also use word-boundary matching: a 6-digit digit string like
-    # "100000" must not match inside a longer 8-digit number ("10000000").
+    # (b) Other providers' current_balance digits must NOT appear in
+    # recommended_topup or anomaly blocks of this provider's slice.
+    # Word-boundary matching: "100000" must not match inside "10000000".
     own_balance = (
         evidence.get("liquidity", {}).get(this_provider, {}).get("current_balance")
     )
@@ -1060,7 +1367,6 @@ def _assert_no_cross_provider_leak(
         str(own_balance).replace(".", "") if own_balance else ""
     )
 
-    # Concatenate just the fields where a leak would actually matter.
     suspicious_fields = {
         "recommended_topup": json.dumps(slice_.get("recommended_topup", {}), default=str),
         "anomaly": json.dumps(slice_.get("anomaly", {}), default=str),
@@ -1075,8 +1381,6 @@ def _assert_no_cross_provider_leak(
         digits = str(other_balance).replace(".", "")
         if len(digits) < 5:
             continue
-        # Skip if it's the same digit string as this provider's own balance
-        # (legitimate coincidence, not a leak).
         if digits == own_balance_digits:
             continue
         for field_name, blob in suspicious_fields.items():
@@ -1095,8 +1399,7 @@ def _assert_no_cross_provider_leak(
                     )
                 idx = j + 1
 
-    # (c) correlated_with must be a list of plain provider-id strings. Any
-    # other shape (dict, list-with-objects) means upstream code regressed.
+    # (c) correlated_with must be a list of plain provider-id strings.
     for entry in slice_.get("correlated_with", []):
         if not isinstance(entry, str):
             raise ValueError(
@@ -1136,8 +1439,6 @@ def build_alert_and_tickets(
     active_providers = list(evidence["anomaly"].keys())
 
     # Per-provider top-up — each ticket gets ITS slice, not shared cash.
-    # The shared-cash top-up is only a fallback if a provider has no own
-    # liquidity entry at all (shouldn't happen but defensive).
     per_provider_topup: Dict[str, Dict[str, Any]] = {}
     shared_topup = evidence["recommended_topup"]
     for p in active_providers:
