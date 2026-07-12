@@ -12,6 +12,7 @@
       <span class="dot"></span>
       <span>Super Agent Intelligence</span>
       <span class="role-tag">AGENT</span>
+      <span id="topbar-alert-chip" class="pill" hidden style="background:var(--red);color:white;font-weight:700;letter-spacing:0.02em;">🚨 <span id="topbar-alert-count">0</span> ACTIVE</span>
     </div>
     <div class="user-tag">
       <span>Shop:</span>
@@ -120,6 +121,15 @@
 
   function buildLiveSectionsShell() {
     return `
+      <div class="active-alerts-panel idle" id="active-alerts-panel">
+        <div class="panel-head">
+          <h3><span>🛎️</span><span>Active Alerts — Status & Next Step</span></h3>
+          <span class="count-pill" id="active-alerts-count">0</span>
+        </div>
+        <div id="active-alerts-body">
+          <div class="empty" id="active-alerts-empty" style="padding:1rem;">No active alerts. Burn rate is within historical norms.</div>
+        </div>
+      </div>
       <div class="grid cols-2" id="live-sections" style="margin-top:1rem;">
         <div class="card">
           <h2>Recent Transactions <small style="color:var(--text-dim);font-weight:400;">Last 15</small></h2>
@@ -133,7 +143,7 @@
           </table>
         </div>
         <div class="card">
-          <h2>Active Alerts <small style="color:var(--text-dim);font-weight:400;" id="alerts-count">0</small></h2>
+          <h2>Alert History <small style="color:var(--text-dim);font-weight:400;" id="alerts-count">0</small></h2>
           <div id="alerts-list">
             <div class="empty" id="alerts-empty">No alerts yet. Burn rate is within historical norms.</div>
           </div>
@@ -462,6 +472,172 @@
     `;
   }
 
+  // -----------------------------------------------------------
+  //  Status / progress helpers for the prominent Active-Alerts panel
+  // -----------------------------------------------------------
+
+  // Lifecycle order: maps ticket status → 0..3 progress index.
+  const STATUS_ORDER = ['OPEN', 'ACKNOWLEDGED', 'UNDER_REVIEW', 'RESOLVED'];
+
+  // Human-readable "next action" copy per status. This is the agent-facing
+  // guidance: what YOU should expect to happen next, regardless of who is
+  // doing the work (officer / analyst).
+  const NEXT_ACTION_COPY = {
+    'OPEN': {
+      label: 'Awaiting officer acknowledgement',
+      en: 'Your territory officer will review and acknowledge. Arrange cash / e-money backup now so you do not run dry.',
+      bn: 'আপনার এলাকা অফিসার শীঘ্রই পর্যালোচনা করবেন। এখনই ক্যাশ / ই-মানি ব্যাকআপের ব্যবস্থা করুন।',
+    },
+    'ACKNOWLEDGED': {
+      label: 'Officer is reviewing',
+      en: 'Territory officer has acknowledged and is reviewing your burn rate. Continue normal transactions; backup is being arranged in parallel.',
+      bn: 'এলাকা অফিসার বিষয়টি জেনে নিয়েছেন এবং আপনার বার্ন রেট পর্যালোচনা করছেন। স্বাভাবিক লেনদেন চালিয়ে যান।',
+    },
+    'UNDER_REVIEW': {
+      label: 'Risk analyst is reviewing',
+      en: 'Escalated to the risk analyst. The analyst is matching your flow against recent event days (Eid, salary cycles). No action required from you yet.',
+      bn: 'ঝুঁকি বিশ্লেষকের কাছে পাঠানো হয়েছে। বিশ্লেষক আপনার প্রবাহকে সাম্প্রতিক ইভেন্টের সাথে মিলিয়ে দেখছেন।',
+    },
+    'RESOLVED': {
+      label: 'Closed — no further action',
+      en: 'Resolved. Officer / analyst has closed this ticket. Resume standard operations.',
+      bn: 'সমাধান হয়েছে। অফিসার / বিশ্লেষক এই টিকিট বন্ধ করেছেন। স্বাভাবিক কার্যক্রম চালিয়ে যান।',
+    },
+  };
+
+  function statusProgressPct(status) {
+    const idx = STATUS_ORDER.indexOf(status);
+    if (idx < 0) return 0;
+    // 25% / 50% / 75% / 100% so each step is visibly distinct.
+    return ((idx + 1) / STATUS_ORDER.length) * 100;
+  }
+
+  // Build ONE row in the prominent "Active Alerts" panel above the cards.
+  // Shows: severity + alert-type + per-ticket status + progress + status
+  // block ("Current: X → Next: Y") + recommendation block (EN + BN).
+  function buildActiveAlertRowHtml(a) {
+    const tickets = a.tickets || [];
+    // Pick the most-urgent ticket as the headline; if any are still OPEN
+    // we show that, else the highest-progress unresolved one. RESOLVED is
+    // rendered separately as a closed notice.
+    const sortedForHeadline = [...tickets].sort((x, y) => {
+      const oi = (s) => STATUS_ORDER.indexOf(s);
+      return oi(x.status || 'OPEN') - oi(y.status || 'OPEN');
+    });
+    const headline = sortedForHeadline[0] || {};
+    const headlineStatus = headline.status || 'OPEN';
+    const headlineIndex = Math.max(0, STATUS_ORDER.indexOf(headlineStatus));
+    const progressPct = statusProgressPct(headlineStatus);
+    const nextCopy = NEXT_ACTION_COPY[headlineStatus] || NEXT_ACTION_COPY['OPEN'];
+
+    // Per-ticket mini pills (one per provider ticket).
+    const ticketPillsHtml = tickets.map((tk) => {
+      const st = tk.status || 'OPEN';
+      const stColor = st === 'RESOLVED' ? 'var(--green)' :
+                      st === 'UNDER_REVIEW' ? '#a855f7' :
+                      st === 'ACKNOWLEDGED' ? 'var(--amber)' : 'var(--red)';
+      return `
+        <span class="ticket-mini">
+          <span class="mini-status st-${DASH.escapeHtml(st)}" style="background:${stColor};color:#0c1d3a;">${DASH.escapeHtml(st)}</span>
+          <span>${DASH.escapeHtml(tk.provider_name || tk.provider_id || '?')}</span>
+          <span style="opacity:0.6;">· ${DASH.escapeHtml(tk.assigned_officer_name || '—')}</span>
+        </span>
+      `;
+    }).join('');
+
+    // "Current status → next action" line.
+    const currentLabel = NEXT_ACTION_COPY[headlineStatus]?.label || headlineStatus;
+    const nextLabel = STATUS_ORDER[headlineIndex + 1]
+      ? NEXT_ACTION_COPY[STATUS_ORDER[headlineIndex + 1]].label
+      : 'No further action';
+
+    // Use the engine's per-alert next_steps as the primary recommendation
+    // copy (it's keyed by alert_type × ticket_status). Fall back to the
+    // generic copy above if next_steps is missing.
+    const ns = a.next_steps || {};
+    const recoEn = ns.en || nextCopy.en;
+    const recoBn = ns.bn || nextCopy.bn;
+
+    // Color the severity badge using existing .sev-* classes (LOW/MEDIUM/HIGH/CRITICAL).
+    return `
+      <div class="alert-row" data-alert-id="${DASH.escapeHtml(a.alert_id || '')}">
+        <div class="row-top">
+          <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || 'LOW')}</span>
+          <span class="alert-title">${DASH.escapeHtml((a.alert_type || '').replace(/_/g, ' '))}</span>
+          <span style="color:var(--text-dim);font-size:0.78rem;">raised <strong style="color:var(--text);">${DASH.escapeHtml(a.created_at || '')}</strong></span>
+          <span class="pill" title="Engine confidence in this alert">conf ${(a.confidence_score ?? 0).toFixed(2)}</span>
+          ${ticketPillsHtml}
+          <div class="progress-track" title="Lifecycle: OPEN → ACKNOWLEDGED → UNDER_REVIEW → RESOLVED">
+            <div class="progress-bar" data-progress-for="${DASH.escapeHtml(a.alert_id || '')}" style="width:${progressPct}%;"></div>
+          </div>
+        </div>
+        <div class="status-block" data-status-for="${DASH.escapeHtml(a.alert_id || '')}">
+          <span style="color:var(--text-dim);">Current status:</span>
+          <span class="pill" style="background:${headlineStatus === 'RESOLVED' ? 'var(--green)' : headlineStatus === 'UNDER_REVIEW' ? 'var(--blue)' : headlineStatus === 'ACKNOWLEDGED' ? 'var(--amber)' : 'var(--red)'};color:#0c1d3a;font-weight:700;">${DASH.escapeHtml(headlineStatus)}</span>
+          <span class="arrow">→</span>
+          <span class="next">Next: ${DASH.escapeHtml(nextLabel)}</span>
+          <span style="color:var(--text-dim);margin-left:auto;font-size:0.75rem;">${DASH.escapeHtml(currentLabel)}</span>
+        </div>
+        <div class="reco-block">
+          <div class="reco-label">📋 What you should do now — পরবর্তী পদক্ষেপ</div>
+          <div class="reco-en">${DASH.escapeHtml(recoEn)}</div>
+          <div class="reco-bn-label">বাংলায়</div>
+          <div class="reco-bn">${DASH.escapeHtml(recoBn)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  // Render the entire Active-Alerts panel from the latest `data.alerts`.
+  // Called on every poll so existing rows are ALSO updated in place when a
+  // ticket transitions (OPEN → ACKNOWLEDGED → UNDER_REVIEW → RESOLVED),
+  // not only when a brand-new alert arrives.
+  function renderActiveAlertsPanel(alerts) {
+    const panel = document.getElementById('active-alerts-panel');
+    const body  = document.getElementById('active-alerts-body');
+    const countEl = document.getElementById('active-alerts-count');
+    if (!panel || !body || !countEl) return;
+
+    const list = Array.isArray(alerts) ? alerts : [];
+    countEl.textContent = String(list.length);
+
+    // Top-bar chip — visible even when the agent has scrolled down past
+    // the panel. Hidden when zero.
+    const topbarChip = document.getElementById('topbar-alert-chip');
+    const topbarCount = document.getElementById('topbar-alert-count');
+    if (topbarChip && topbarCount) {
+      topbarCount.textContent = String(list.length);
+      topbarChip.hidden = (list.length === 0);
+      // Color the chip by highest severity on the active set.
+      if (list.length > 0) {
+        const sevOrder = { 'LOW': 0, 'MEDIUM': 1, 'HIGH': 2, 'CRITICAL': 3 };
+        let maxSev = 'LOW';
+        for (const a of list) {
+          const s = String(a.severity || 'LOW').toUpperCase();
+          if (sevOrder[s] != null && sevOrder[s] > sevOrder[maxSev]) maxSev = s;
+        }
+        const sevColor = maxSev === 'CRITICAL' ? 'var(--purple)'
+                       : maxSev === 'HIGH'     ? 'var(--red)'
+                       : maxSev === 'MEDIUM'   ? 'var(--amber)'
+                       :                          'var(--green)';
+        topbarChip.style.background = sevColor;
+        topbarChip.style.color = (maxSev === 'MEDIUM' || maxSev === 'LOW') ? '#0c1d3a' : 'white';
+      }
+    }
+
+    if (list.length === 0) {
+      panel.classList.add('idle');
+      body.innerHTML = `<div class="empty" id="active-alerts-empty" style="padding:1rem;">No active alerts. Burn rate is within historical norms.</div>`;
+      return;
+    }
+    panel.classList.remove('idle');
+
+    // Build ordered HTML. Newest first so the most-recent alert is at the
+    // top of the panel — the agent's eye lands there first.
+    const sorted = [...list].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    body.innerHTML = sorted.map(buildActiveAlertRowHtml).join('');
+  }
+
   function appendNewAlerts(newAlerts) {
     if (!newAlerts || newAlerts.length === 0) return;
     const list = document.getElementById('alerts-list');
@@ -600,7 +776,8 @@
             const emptyRow = document.getElementById('txn-empty-row');
             if (emptyRow) emptyRow.remove();
           }
-          // Insert alerts (newest first)
+          // Insert alert HISTORY cards (full detail + lifecycle + next-step
+          // note) into the right-hand "Alert History" card.
           const sortedAlerts = [...allAlerts].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
           for (const a of sortedAlerts) {
             const card = document.createElement('div');
@@ -615,6 +792,10 @@
           const countEl = document.getElementById('alerts-count');
           if (countEl) countEl.textContent = String(allAlerts.length);
         }
+        // NEW: Render the prominent Active-Alerts panel (status + next-step)
+        // for every alert the agent has — independent of sim state. Keeps
+        // the panel accurate on every full-rebuild.
+        renderActiveAlertsPanel(allAlerts);
         lastSimRunning = simRunning;
         firstRenderDone = true;
         return;  // layout already shows latest balances via buildLayout()
@@ -625,6 +806,10 @@
       // any newly arrived txns / alerts. NO full DOM repaint.
       updateBalances(data);
       showShortageToasts(data.shortage_warnings || []);
+      // NEW: refresh the Active-Alerts panel every poll so existing rows
+      // pick up ticket-status transitions (OPEN → ACKNOWLEDGED →
+      // UNDER_REVIEW → RESOLVED) without waiting for a brand-new alert.
+      renderActiveAlertsPanel(allAlerts);
       if (simRunning) {
         updateSimStatusChip(simState.sim || {});
         const newTxns   = allTxns.filter(t => !seenTxnIds.has(t.tx_id));

@@ -187,6 +187,157 @@ main {
 .st-ACKNOWLEDGED { background: var(--amber); color: #1f2937; }
 .st-UNDER_REVIEW { background: var(--blue); }
 .st-RESOLVED { background: var(--green); }
+
+/* === Active Alerts Panel — sits above the balance cards =========== */
+/* Each active alert gets a row with:                                    */
+/*   • Top-line: title + severity + ticket status pill + progress        */
+/*   • Status block: "Current: X → Next: Y" lifecycle line               */
+/*   • Recommendation block: EN + Bangla next-step copy                  */
+.active-alerts-panel {
+  background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+  border: 1px solid #4c1d95;
+  border-left: 4px solid var(--purple);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 4px 18px rgba(124, 58, 237, 0.18);
+}
+.active-alerts-panel.idle {
+  background: var(--bg-card);
+  border: 1px dashed var(--border);
+  border-left: 4px solid var(--green);
+  box-shadow: none;
+}
+.active-alerts-panel .panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.85rem;
+}
+.active-alerts-panel .panel-head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.active-alerts-panel .panel-head .count-pill {
+  background: var(--purple);
+  color: white;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.active-alerts-panel.idle .panel-head .count-pill { background: var(--green); color: #0c1d3a; }
+.active-alerts-panel .alert-row {
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  margin-bottom: 0.65rem;
+}
+.active-alerts-panel .alert-row:last-child { margin-bottom: 0; }
+.active-alerts-panel .alert-row .row-top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-bottom: 0.55rem;
+}
+.active-alerts-panel .alert-row .alert-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.active-alerts-panel .alert-row .ticket-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  background: var(--bg-card-2);
+  color: var(--text-dim);
+}
+.active-alerts-panel .alert-row .ticket-mini .mini-status {
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+.active-alerts-panel .alert-row .progress-track {
+  flex: 1;
+  min-width: 120px;
+  height: 6px;
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.active-alerts-panel .alert-row .progress-track .progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--red), var(--amber), var(--blue), var(--green));
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}
+.active-alerts-panel .alert-row .status-block {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0.55rem 0.75rem;
+  background: rgba(56, 189, 248, 0.08);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  margin-bottom: 0.55rem;
+  font-size: 0.82rem;
+}
+.active-alerts-panel .alert-row .status-block .arrow { color: var(--text-dim); padding: 0 0.15rem; }
+.active-alerts-panel .alert-row .status-block .next {
+  font-weight: 600;
+  color: var(--text);
+}
+.active-alerts-panel .alert-row .reco-block {
+  padding: 0.7rem 0.85rem;
+  background: rgba(168, 85, 247, 0.10);
+  border-left: 3px solid #a855f7;
+  border-radius: 6px;
+}
+.active-alerts-panel .alert-row .reco-block .reco-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #c084fc;
+  margin-bottom: 0.3rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.active-alerts-panel .alert-row .reco-block .reco-en {
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 0.3rem;
+  line-height: 1.45;
+}
+.active-alerts-panel .alert-row .reco-block .reco-bn {
+  font-size: 0.85rem;
+  color: var(--text);
+  font-family: "Noto Sans Bengali", sans-serif;
+  line-height: 1.5;
+}
+.active-alerts-panel .alert-row .reco-block .reco-bn-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin-bottom: 0.2rem;
+}
 table {
   width: 100%;
   border-collapse: collapse;
