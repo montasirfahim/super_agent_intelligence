@@ -144,6 +144,14 @@ RECON_TOLERANCE = Decimal("0.01")
 CONTRIBUTION_THRESHOLD = Decimal("0.20")
 NORMALIZATION_CAP = 6.0
 
+# Predict-ahead threshold for the early-shortage alert. If any provider's
+# or the shared drawer's ETA falls within this many minutes, the engine
+# fires a LIQUIDITY_SHORTAGE alert even when overall_severity is "low"
+# (no behavioral anomaly). Tunable per deployment — the hackathon demo
+# uses 120 minutes so the officer gets 2 hours of lead time before the
+# agent runs dry.
+SHORTAGE_THRESHOLD_MINUTES = 60
+
 
 # ---------------------------------------------------------------------------
 # Domain types
@@ -1209,13 +1217,28 @@ def determine_responsible_providers(
     evidence: Dict[str, Any], providers: Sequence[str]
 ) -> List[str]:
     """A provider is responsible if it tripped any anomaly, is in the correlated
-    set, or contributed ≥ 20% of the shared burn in a liquidity-only case."""
+    set, contributed ≥ 20% of the shared burn in a liquidity-only case, OR has
+    its own wallet ETA below SHORTAGE_THRESHOLD_MINUTES.
+
+    The per-wallet ETA check is what makes the early-shortage alerts
+    fire: when only ONE provider's e-money is depleting (e.g., bKash at
+    ETA=45 min while the shared drawer is fine), that single provider
+    still gets a ticket so the right officer is paged. Without this,
+    a per-wallet drain would be silently dropped because no anomaly
+    fired and the shared drawer isn't short.
+    """
     resp: set = set()
     total_weighted = Decimal("0")
     for p in providers:
         if evidence["anomaly"][p]["velocity_anomaly"] or evidence["anomaly"][p]["structuring_anomaly"]:
             resp.add(p)
         if p in evidence["correlated_providers"]:
+            resp.add(p)
+        # Per-wallet ETA — include providers whose own e-money will
+        # deplete within the shortage threshold.
+        prov_pred = evidence["liquidity"].get(p, {})
+        prov_eta = prov_pred.get("eta_minutes")
+        if prov_eta is not None and prov_eta <= SHORTAGE_THRESHOLD_MINUTES:
             resp.add(p)
         total_weighted += Decimal(evidence["liquidity"][p]["burn_rate_weighted"])
 
@@ -1408,6 +1431,64 @@ def _assert_no_cross_provider_leak(
             )
 
 
+def compute_shortage_warnings(
+    evidence: Dict[str, Any],
+    threshold_minutes: int = SHORTAGE_THRESHOLD_MINUTES,
+) -> List[Dict[str, Any]]:
+    """Surface per-balance predicted-time-to-zero warnings BEFORE zero hits.
+
+    Iterates `evidence["liquidity"]` (shared_cash + per-provider slices)
+    and emits one warning row per balance whose `eta_minutes` is set and
+    within `threshold_minutes`. Each row carries:
+
+      - provider_id     "shared_cash" | "1" | "2" | "3"
+      - eta_minutes     int — minutes until the balance hits zero at the
+                        current weighted burn rate
+      - current_balance str — same value as the slice, kept here so the
+                        downstream ticket/UI doesn't need to re-parse
+                        the evidence dict
+      - burn_rate_weighted str — BDT/min, also re-exported
+      - confidence      "low" | "medium" | "high"
+
+    These rows drive BOTH the early-shortage alert (so the engine can
+    fire when overall_severity is still "low") AND the agent dashboard's
+    inline "⚠ Drains in X min" + top-up recommendation.
+
+    Pure function over `analyze()` output — no DB, no time.
+    """
+    warnings: List[Dict[str, Any]] = []
+    for key, pred in evidence.get("liquidity", {}).items():
+        eta = pred.get("eta_minutes")
+        if eta is None:
+            continue
+        if eta > threshold_minutes:
+            continue
+        warnings.append({
+            "provider_id": key,            # "shared_cash" or "1"/"2"/"3"
+            "eta_minutes": int(eta),
+            "current_balance": pred.get("current_balance", "0"),
+            "burn_rate_weighted": pred.get("burn_rate_weighted", "0"),
+            "confidence": pred.get("confidence", "low"),
+        })
+    # Sort: most-urgent first (smallest eta).
+    warnings.sort(key=lambda w: w["eta_minutes"])
+    return warnings
+
+
+def severity_for_shortage(eta_minutes: int) -> str:
+    """Bucket an ETA into severity tiers for shortage-warning alerts.
+
+    > 60 min   → MEDIUM (proactive warning)
+    ≤ 60 min   → HIGH   (within the hour)
+    ≤ 15 min   → CRITICAL (imminent depletion)
+    """
+    if eta_minutes <= 15:
+        return "CRITICAL"
+    if eta_minutes <= 60:
+        return "HIGH"
+    return "MEDIUM"
+
+
 def build_alert_and_tickets(
     db: Session,
     agent_id: str,
@@ -1419,10 +1500,33 @@ def build_alert_and_tickets(
     Each ticket carries ITS provider's top-up amount — never the shared
     drawer's. We compute per-provider top-up here so `build_ticket()` can
     receive the right slice.
+
+    NEW BEHAVIOR (early-shortage alerts):
+      The gate `overall_severity == "low" and not warnings` previously
+      suppressed ALL alerts when nothing behavioral fired. Now we also
+      compute `shortage_warnings` (any balance with ETA ≤
+      SHORTAGE_THRESHOLD_MINUTES minutes). If the gate would suppress
+      but shortage warnings exist, we PROCEED in shortage-warning mode:
+      the resulting `alert` is built with `alert_type=LIQUIDITY_SHORTAGE`
+      and severity bucketed from the smallest ETA, AND every responsible
+      provider gets a ticket carrying the shortage slice (current balance
+      + suggested top-up).
     """
     evidence = analyze(db, agent_id, t, providers=providers)
+    shortage_warnings = compute_shortage_warnings(evidence)
+
     if evidence["overall_severity"] == "low" and not evidence["warnings"]:
-        return {"alert": None, "tickets": []}
+        if not shortage_warnings:
+            return {
+                "alert": None,
+                "tickets": [],
+                "shortage_warnings": [],
+                "mode": "silent",
+            }
+        # Early-shortage path: gate suppressed but a balance is about to
+        # deplete. Promote severity and continue to build alert+tickets.
+        worst_eta = shortage_warnings[0]["eta_minutes"]
+        evidence = {**evidence, "overall_severity": severity_for_shortage(worst_eta).lower()}
 
     alert = {
         "alert_id": _new_id(),
@@ -1455,4 +1559,9 @@ def build_alert_and_tickets(
         )
         for p in responsible
     ]
-    return {"alert": alert, "tickets": tickets}
+    return {
+        "alert": alert,
+        "tickets": tickets,
+        "shortage_warnings": shortage_warnings,
+        "mode": "anomaly" if evidence["overall_severity"] != "low" else "silent",
+    }

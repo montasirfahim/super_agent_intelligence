@@ -162,6 +162,11 @@
     const physTxCount  = phys.tx_count_total || 0;
     const physDraining = physNet < 0;
     const physAccent   = physDraining ? 'var(--red)' : 'var(--green)';
+    // Predictive — drives the "⚠ Drains in N min" line under the
+    // physical-cash balance. Used inline only; shared drawer has no
+    // per-provider officer routing.
+    const physEta       = phys.eta_minutes;
+    const physTopupFmt  = phys.eta_recommended_topup_fmt || '';
 
     // "Starting" derives implicitly: starting = current + (cash_out − cash_in).
     // This stays consistent with the visible drained amount even though
@@ -186,6 +191,10 @@
         <div class="runway" id="physical-this-poll" style="background:rgba(56,189,248,0.08);padding:0.4rem 0.6rem;border-radius:6px;margin-top:0.4rem;display:none;">
           <span style="color:var(--accent);font-size:0.78rem;" id="physical-this-poll-text"></span>
         </div>
+        <div class="physical-eta-row" id="physical-eta-row" ${physEta == null ? 'hidden' : ''} style="margin-top:0.4rem;font-size:0.78rem;color:var(--red);">
+          <span>⚠ Shared drawer drains in <strong id="physical-eta">${physEta == null ? '—' : physEta}</strong> min</span>
+          <span style="margin-left:0.4rem;color:var(--text);">· Top up <strong id="physical-topup">${DASH.escapeHtml(physTopupFmt)}</strong></span>
+        </div>
       </div>
     `;
 
@@ -207,6 +216,13 @@
       const wCashIn  = w.cash_in_total || 0;
       const wBalance = w.balance || 0;
       const wStarting = wBalance + (wCashOut - wCashIn);
+      const wEta = w.eta_minutes;
+      const wTopup = w.eta_recommended_topup_fmt || '';
+      const wOfficer = w.assigned_officer_name || '';
+      const wRejected = w.rejected_count || 0;
+      const anom = w.active_anomaly_summary || {};
+      const flaggedN = anom.flagged_customer_count || 0;
+      const hasAnom = (anom.has_velocity || anom.has_structuring || flaggedN > 0);
       return `
         <div class="balance-card ${pkey}" id="card-wallet-${pkey}">
           <div class="label">${DASH.escapeHtml(w.provider_name)} E-Money</div>
@@ -221,6 +237,17 @@
           <div class="runway">
             <span>Net: <strong id="wallet-${pkey}-net" style="color:${wDrain ? 'var(--red)' : 'var(--green)'};">${fmtBDT(w.net_total || (wCashIn - wCashOut))}</strong></span>
             <span class="badge sev-LOW" id="wallet-${pkey}-badge">${wDrain ? 'DRAINING' : 'STABLE'}</span>
+          </div>
+          <div class="wallet-eta-row" id="wallet-${pkey}-eta-row" ${wEta == null ? 'hidden' : ''} style="margin-top:0.4rem;font-size:0.78rem;color:var(--red);">
+            <span>⚠ Drains in <strong id="wallet-${pkey}-eta">${wEta == null ? '—' : wEta}</strong> min</span>
+            <span style="margin-left:0.4rem;color:var(--text);">· Top up <strong id="wallet-${pkey}-topup">${DASH.escapeHtml(wTopup)}</strong></span>
+            <span style="margin-left:0.4rem;color:var(--text-dim);">· Routed to <span id="wallet-${pkey}-officer">${DASH.escapeHtml(wOfficer)}</span></span>
+          </div>
+          <div class="wallet-rejected-row" id="wallet-${pkey}-rejected-row" ${wRejected === 0 ? 'hidden' : ''} style="margin-top:0.25rem;font-size:0.78rem;color:var(--red);">
+            🚫 <span id="wallet-${pkey}-rejected">${wRejected}</span> rejected this session
+          </div>
+          <div class="wallet-behavior-chip" id="wallet-${pkey}-behavior-chip" ${hasAnom ? '' : 'hidden'} style="margin-top:0.25rem;font-size:0.75rem;color:#7c3aed;">
+            ⚠ <span id="wallet-${pkey}-flagged-count">${flaggedN}</span> flagged customer${flaggedN === 1 ? '' : 's'}
           </div>
         </div>
       `;
@@ -295,6 +322,15 @@
     setStyle('physical-net',        'color', physAccent);
     setText('physical-badge',       physDraining ? 'DRAINING' : 'STABLE');
 
+    // Physical-cash predictive line (server-authoritative ETA).
+    const physEta = phys.eta_minutes;
+    const physEtaRow = document.getElementById('physical-eta-row');
+    if (physEtaRow) physEtaRow.hidden = (physEta == null);
+    if (physEta != null) {
+      setText('physical-eta',   String(physEta));
+      setText('physical-topup', phys.eta_recommended_topup_fmt || '');
+    }
+
     for (const w of wlist) {
       const pkey = WALLET_KEY[w.provider_name] || String(w.provider_name).toLowerCase();
       const wDrain  = (w.net_total || 0) < 0;
@@ -313,6 +349,31 @@
       setText(`wallet-${pkey}-net`,         fmtBDT(wNet));
       setStyle(`wallet-${pkey}-net`,        'color', wAccent);
       setText(`wallet-${pkey}-badge`,       wDrain ? 'DRAINING' : 'STABLE');
+
+      // Predictive: ETA / top-up / routed officer. Show row only when the
+      // engine actually produced an ETA (eta_minutes is null → stable).
+      const wEta = w.eta_minutes;
+      const wEtaRow = document.getElementById(`wallet-${pkey}-eta-row`);
+      if (wEtaRow) wEtaRow.hidden = (wEta == null);
+      if (wEta != null) {
+        setText(`wallet-${pkey}-eta`,     String(wEta));
+        setText(`wallet-${pkey}-topup`,   w.eta_recommended_topup_fmt || '');
+        setText(`wallet-${pkey}-officer`, w.assigned_officer_name || '—');
+      }
+
+      // Rejection counter — server-driven; visible whenever > 0.
+      const wRej = w.rejected_count || 0;
+      const wRejRow = document.getElementById(`wallet-${pkey}-rejected-row`);
+      if (wRejRow) wRejRow.hidden = (wRej === 0);
+      setText(`wallet-${pkey}-rejected`, String(wRej));
+
+      // Behavioral-anomaly chip — visible when any anomaly flag is set.
+      const anom = w.active_anomaly_summary || {};
+      const flaggedN = anom.flagged_customer_count || 0;
+      const hasAnom = !!(anom.has_velocity || anom.has_structuring || flaggedN > 0);
+      const wChip = document.getElementById(`wallet-${pkey}-behavior-chip`);
+      if (wChip) wChip.hidden = !hasAnom;
+      setText(`wallet-${pkey}-flagged-count`, String(flaggedN));
     }
   }
 
@@ -364,6 +425,43 @@
     while (tbody.children.length > 15) tbody.removeChild(tbody.lastChild);
   }
 
+  function buildAlertCardHtml(a) {
+    // Ticket lifecycle: one row per ticket with status pill + officer.
+    // The lifecycle is OPEN → ACKNOWLEDGED → UNDER_REVIEW → RESOLVED,
+    // and the agent sees WHERE in that chain each ticket currently is.
+    const ticketsHtml = (a.tickets || []).map((tk) => {
+      const st = tk.status || 'OPEN';
+      const stColor = st === 'RESOLVED' ? 'var(--green)' :
+                      st === 'UNDER_REVIEW' ? '#a855f7' :
+                      st === 'ACKNOWLEDGED' ? 'var(--accent)' : 'var(--red)';
+      const owner = tk.current_owner_role || 'FIELD_OFFICER';
+      return `
+        <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;font-size:0.78rem;margin-top:0.3rem;">
+          <code style="font-size:0.72rem;opacity:0.7;">${DASH.escapeHtml((tk.ticket_id || '').slice(0,8))}</code>
+          <span class="pill" style="background:${stColor};color:#0c1d3a;font-weight:600;">${DASH.escapeHtml(st)}</span>
+          <span style="opacity:0.8;">→ ${DASH.escapeHtml(owner)}</span>
+          <span style="opacity:0.6;">· ${DASH.escapeHtml(tk.provider_name || tk.provider_id || '')}</span>
+          <span style="opacity:0.6;">· ${DASH.escapeHtml(tk.assigned_officer_name || '—')}</span>
+        </div>
+      `;
+    }).join('');
+    // Customer-support next-step guidance — Bangla primary, English fallback.
+    const ns = a.next_steps || {};
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
+        <div>
+          <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || '')}</span>
+          <span class="pill">${DASH.escapeHtml((a.alert_type || '').replace('_', ' '))}</span>
+          <span class="pill">C=${(a.confidence_score ?? 0).toFixed(3)}</span>
+        </div>
+        <small class="sub">${DASH.escapeHtml(a.created_at || '')}</small>
+      </div>
+      <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn || '')}</p>
+      ${ticketsHtml ? `<div style="margin-top:0.5rem;padding-top:0.5rem;border-top:1px dashed var(--border);"><div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:0.2rem;">Ticket lifecycle</div>${ticketsHtml}</div>` : ''}
+      ${ns.bn ? `<div style="margin-top:0.5rem;padding:0.5rem 0.7rem;background:rgba(168,85,247,0.08);border-left:3px solid #a855f7;border-radius:4px;"><div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:#a855f7;margin-bottom:0.2rem;">Customer support — পরবর্তী পদক্ষেপ</div><div class="bangla" style="font-size:0.85rem;color:var(--text);">${DASH.escapeHtml(ns.bn)}</div><div style="font-size:0.78rem;color:var(--text-dim);margin-top:0.3rem;font-style:italic;">${DASH.escapeHtml(ns.en || '')}</div></div>` : ''}
+    `;
+  }
+
   function appendNewAlerts(newAlerts) {
     if (!newAlerts || newAlerts.length === 0) return;
     const list = document.getElementById('alerts-list');
@@ -380,22 +478,64 @@
       const card = document.createElement('div');
       card.className = 'card';
       card.style.marginBottom = '0.6rem';
-      card.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
-          <div>
-            <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || '')}</span>
-            <span class="pill">${DASH.escapeHtml((a.alert_type || '').replace('_', ' '))}</span>
-            <span class="pill">C=${(a.confidence_score ?? 0).toFixed(3)}</span>
-          </div>
-          <small class="sub">${DASH.escapeHtml(a.created_at || '')}</small>
-        </div>
-        <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn || '')}</p>
-      `;
+      card.innerHTML = buildAlertCardHtml(a);
       list.insertBefore(card, list.firstChild);
     }
     // Update count chip
     const countEl = document.getElementById('alerts-count');
     if (countEl) countEl.textContent = String(seenAlertIds.size);
+  }
+
+  // ============================================================
+  //  Shortage-warning toasts — fire once per (provider, eta-bucket) so
+  //  the agent sees a non-blocking banner on every poll where any
+  //  provider's predictive ETA is still ≤ the server threshold.
+  // ============================================================
+
+  // Track which warnings we've already toasted this session so the same
+  // bKash "16 min" warning doesn't spam the agent every 5s.
+  const toastedWarnings = new Set();
+
+  function showShortageToasts(warnings) {
+    if (!warnings || warnings.length === 0) return;
+    // Lazily create the toast container (fixed top-right). One element
+    // reused across toasts so styling stays consistent.
+    let container = document.getElementById('shortage-toast-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'shortage-toast-container';
+      container.style.cssText = 'position:fixed;top:1rem;right:1rem;z-index:1000;display:flex;flex-direction:column;gap:0.5rem;max-width:360px;';
+      document.body.appendChild(container);
+    }
+    for (const w of warnings) {
+      // Dedup key: provider + eta + topup-rounded. If a provider recovers
+      // (ETA disappears) and reappears later at a different ETA, the new
+      // value will toast again — exactly what the agent needs.
+      const dedupKey = `${w.provider_id}|${w.eta_minutes}|${w.recommended_topup_fmt}`;
+      if (toastedWarnings.has(dedupKey)) continue;
+      toastedWarnings.add(dedupKey);
+
+      const toast = document.createElement('div');
+      toast.className = 'shortage-toast';
+      const officerLine = w.assigned_officer_name
+        ? `<div style="font-size:0.72rem;color:var(--text-dim);margin-top:0.2rem;">Alert sent to <strong>${DASH.escapeHtml(w.assigned_officer_name)}</strong></div>`
+        : '';
+      toast.style.cssText = 'background:#1e293b;border-left:4px solid var(--red);color:var(--text);padding:0.7rem 0.9rem;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.3);font-size:0.85rem;animation:slideIn 0.3s ease;';
+      toast.innerHTML = `
+        <div style="display:flex;align-items:start;gap:0.5rem;">
+          <span style="font-size:1.1rem;">⚠</span>
+          <div style="flex:1;">
+            <div><strong>${DASH.escapeHtml(w.provider_name)}</strong> drains in <strong>${w.eta_minutes} min</strong></div>
+            <div style="font-size:0.78rem;margin-top:0.2rem;">Current: ${DASH.escapeHtml(w.current_balance_fmt || '৳0')} · Top up recommended: <strong>${DASH.escapeHtml(w.recommended_topup_fmt || '৳0')}</strong></div>
+            ${officerLine}
+          </div>
+          <button style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:1rem;padding:0;line-height:1;" onclick="this.parentElement.parentElement.remove()" title="Dismiss">×</button>
+        </div>
+      `;
+      container.appendChild(toast);
+      // Auto-dismiss after 8 seconds.
+      setTimeout(() => { if (toast.parentNode) toast.remove(); }, 8000);
+    }
   }
 
   // ============================================================
@@ -427,6 +567,9 @@
         // Full layout rebuild — only when sim state changed (rare) or on
         // first load. This swaps the start-block ↔ live-sections cleanly.
         main.innerHTML = buildLayout(data, simState);
+        // Fire shortage-warning toasts after the rebuild so they appear
+        // above the fresh layout. Dedup is handled inside the helper.
+        showShortageToasts(data.shortage_warnings || []);
         // Reset dedup sets so the rebuild can re-render existing rows.
         seenTxnIds.clear();
         seenAlertIds.clear();
@@ -463,17 +606,7 @@
             const card = document.createElement('div');
             card.className = 'card';
             card.style.marginBottom = '0.6rem';
-            card.innerHTML = `
-              <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;">
-                <div>
-                  <span class="badge sev-${DASH.escapeHtml(a.severity || 'LOW')}">${DASH.escapeHtml(a.severity || '')}</span>
-                  <span class="pill">${DASH.escapeHtml((a.alert_type || '').replace('_', ' '))}</span>
-                  <span class="pill">C=${(a.confidence_score ?? 0).toFixed(3)}</span>
-                </div>
-                <small class="sub">${DASH.escapeHtml(a.created_at || '')}</small>
-              </div>
-              <p class="bangla" style="margin:0.6rem 0 0 0;color:var(--text);">${DASH.escapeHtml(a.message_bn || '')}</p>
-            `;
+            card.innerHTML = buildAlertCardHtml(a);
             const list = document.getElementById('alerts-list');
             if (list) list.appendChild(card);
           }
@@ -491,6 +624,7 @@
       // Update only the sim chip fields, balance numbers, and prepend
       // any newly arrived txns / alerts. NO full DOM repaint.
       updateBalances(data);
+      showShortageToasts(data.shortage_warnings || []);
       if (simRunning) {
         updateSimStatusChip(simState.sim || {});
         const newTxns   = allTxns.filter(t => !seenTxnIds.has(t.tx_id));

@@ -360,3 +360,137 @@ def test_evaluate_creates_provider_isolated_tickets():
         assert x in ("1", "2", "3") and x != "1"
     for x in ng_slice["correlated_with"]:
         assert x in ("1", "2", "3") and x != "2"
+
+
+# ---------------------------------------------------------------------------
+# Layer 4/5 dashboard surface: per-card predictive + behavioral fields
+# ---------------------------------------------------------------------------
+
+def test_agent_view_surfaces_eta_and_topup_per_wallet():
+    """Each wallet card on /api/dashboard/agent carries:
+        - eta_minutes (int or null)
+        - eta_recommended_topup_fmt (BDT-formatted string)
+        - assigned_officer_id + assigned_officer_name (when ETA is present)
+        - rejected_count (int)
+        - active_anomaly_summary (object)
+    """
+    agents = client.get("/api/lookup/agents").json()
+    aid = agents[0]["agent_id"]
+    r = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}")
+    assert r.status_code == 200
+    body = r.json()
+    for w in body["wallets"]:
+        # Keys MUST exist (even when stable → null/0)
+        assert "eta_minutes" in w
+        assert "eta_recommended_topup_fmt" in w
+        assert "assigned_officer_id" in w
+        assert "assigned_officer_name" in w
+        assert "rejected_count" in w
+        assert "active_anomaly_summary" in w
+        # Types
+        assert w["eta_minutes"] is None or isinstance(w["eta_minutes"], int)
+        assert isinstance(w["eta_recommended_topup_fmt"], str)
+        assert isinstance(w["assigned_officer_id"], str)
+        assert isinstance(w["assigned_officer_name"], str)
+        assert isinstance(w["rejected_count"], int)
+        assert isinstance(w["active_anomaly_summary"], dict)
+        # active_anomaly_summary schema
+        anom = w["active_anomaly_summary"]
+        assert "has_velocity" in anom
+        assert "has_structuring" in anom
+        assert "flagged_customer_count" in anom
+        assert "composite_score" in anom
+        assert "derived_severity" in anom
+
+
+def test_agent_view_surfaces_eta_on_physical_card():
+    """The shared-drawer physical block carries the same predictive fields
+    (eta_minutes, eta_recommended_topup_fmt) but does NOT carry an officer
+    routing field (the shared drawer has no assigned officer — the agent sees
+    it directly in their dashboard)."""
+    agents = client.get("/api/lookup/agents").json()
+    aid = agents[0]["agent_id"]
+    r = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}")
+    body = r.json()
+    phys = body["physical"]
+    assert "eta_minutes" in phys
+    assert "eta_recommended_topup_fmt" in phys
+    # Physical block may not have an officer — that's intentional.
+    # But it MUST have t_runaway_fmt and severity so the UI can render
+    # the "Stable" / "Drains in N min" line.
+    assert "t_runaway_fmt" in phys
+    assert "severity" in phys
+
+
+def test_agent_view_emits_top_level_shortage_warnings_array():
+    """The agent dashboard payload's top-level `shortage_warnings` array
+    lists every provider with ETA ≤ 120 min. Each entry has provider_id,
+    provider_name, eta_minutes, current_balance_fmt, recommended_topup_fmt,
+    assigned_officer_id, assigned_officer_name."""
+    agents = client.get("/api/lookup/agents").json()
+    aid = agents[0]["agent_id"]
+    r = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}")
+    body = r.json()
+    assert "shortage_warnings" in body
+    assert isinstance(body["shortage_warnings"], list)
+    # Each entry (if any) has the schema
+    for w in body["shortage_warnings"]:
+        assert "provider_id" in w
+        assert "provider_name" in w
+        assert "eta_minutes" in w
+        assert isinstance(w["eta_minutes"], int)
+        assert "current_balance_fmt" in w
+        assert "recommended_topup_fmt" in w
+        assert "assigned_officer_id" in w
+        assert "assigned_officer_name" in w
+
+
+def test_agent_view_shortage_warnings_match_wallet_cards():
+    """When a provider is in `shortage_warnings`, the SAME provider's wallet
+    card MUST have eta_minutes set (consistency between top-level toasts and
+    inline card display)."""
+    agents = client.get("/api/lookup/agents").json()
+    aid = agents[0]["agent_id"]
+    r = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}")
+    body = r.json()
+    by_pid = {w["provider_id"]: w for w in body["wallets"]}
+    for warn in body["shortage_warnings"]:
+        pid = warn["provider_id"]
+        assert pid in by_pid, f"shortage warning for unknown provider {pid}"
+        wallet = by_pid[pid]
+        # The wallet's eta_minutes should be set and ≤ the threshold
+        assert wallet["eta_minutes"] is not None
+        assert wallet["eta_minutes"] <= 120
+        assert wallet["eta_minutes"] == warn["eta_minutes"]
+
+
+def test_agent_view_rejected_count_increments_after_inject():
+    """After calling /api/simulate/inject-transaction with a rejected amount,
+    /api/dashboard/agent MUST show rejected_count incremented for that
+    (provider, tx_type)."""
+    agents = client.get("/api/lookup/agents").json()
+    aid = agents[0]["agent_id"]
+
+    # Fetch dashboard once before injection to capture baseline counts
+    before = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}").json()
+    bk_before = next(w for w in before["wallets"] if w["provider_name"] == "bKash")
+    bk_rej_before = bk_before["rejected_count"]
+
+    # Force a rejection: CASH_IN 999999 on bKash (wallet can't cover).
+    r = client.post("/api/simulate/inject-transaction", json={
+        "agent_id": aid,
+        "provider_id": "1",
+        "type": "CASH_IN",
+        "amount": 999999,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    if not body.get("rejected"):
+        import pytest; pytest.skip("injection was accepted; balance too high for this seed")
+
+    # Re-fetch dashboard — rejected_count should be ≥ previous + 1
+    after = client.get(f"/api/dashboard/agent?role=agent&user_id={aid}").json()
+    bk_after = next(w for w in after["wallets"] if w["provider_name"] == "bKash")
+    assert bk_after["rejected_count"] >= bk_rej_before + 1, (
+        f"rejected_count didn't increment: {bk_rej_before} -> {bk_after['rejected_count']}"
+    )

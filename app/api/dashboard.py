@@ -12,7 +12,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import selectinload
@@ -38,6 +38,16 @@ from app.models import (
     TransactionStream,
     TransactionType,
 )
+from app.services.analytics_engine import (
+    compute_shortage_warnings,
+    predict_shortage,
+)
+from app.services.routing import route_to_officer
+# Re-import the sim module lazily inside functions that need the
+# rejection counters (avoids a circular import at module-load time).
+# `get_rejection_counts(agent_id)` returns a dict keyed by
+# "<agent_id>|<provider_id>|<tx_type>".
+from app.api import simulation as _sim_api  # noqa: E402
 
 
 router = APIRouter(tags=["dashboard"])
@@ -55,11 +65,129 @@ def now_naive() -> datetime:
 
 PROVIDER_NAME = {"1": "bKash", "2": "Nagad", "3": "Rocket"}
 
+# Inline per-wallet threshold for shortage-warning chips. Mirrors
+# `analytics_engine.SHORTAGE_THRESHOLD_MINUTES` — keep them in sync.
+SHORTAGE_THRESHOLD_MINUTES = 60
 
-def fmt_bdt(value: Decimal | float | int | None) -> str:
+
+def _office_name(db: Session, office_id: str) -> str:
+    """Best-effort display name for a territory office. Returns the id
+    itself if the office is missing (so the chip still renders)."""
+    if not office_id:
+        return ""
+    row = db.get(TerritoryOffice, office_id)
+    if row is None:
+        return office_id
+    return getattr(row, "name", None) or office_id
+
+
+def _rejected_count_for(agent_id: str, provider_id: str) -> int:
+    """Sum rejections for this (agent, provider) across both tx types.
+    Reads from the in-process registry in the simulation module — no
+    DB roundtrip (the user explicitly chose in-memory storage).
+    """
+    raw = _sim_api.get_rejection_counts(agent_id)
+    total = 0
+    for k, v in raw.items():
+        # key shape: "<agent_id>|<provider_id>|<tx_type>"
+        parts = k.split("|")
+        if len(parts) != 3:
+            continue
+        _, pid, _ = parts
+        if pid == provider_id:
+            total += int(v)
+    return total
+
+
+# Customer-support next-step suggestions surfaced to the agent on every
+# alert/ticket. Plain-language + Bangla so the agent (and any regional
+# helper) knows what to do RIGHT NOW based on alert type and the ticket's
+# current escalation state.
+NEXT_STEPS_BY_TYPE = {
+    "LIQUIDITY_SHORTAGE": {
+        "OPEN": {
+            "en": "Alert sent to your territory officer. Arrange cash/e-money backup now so you don't run dry. Officer is reviewing your burn rate.",
+            "bn": "আপনার এলাকা অফিসারকে জানানো হয়েছে। এখনই ক্যাশ/ই-মানি ব্যাকআপের ব্যবস্থা করুন যাতে ব্যালেন্স শূন্য না হয়ে যায়। অফিসার আপনার বার্ন রেট পর্যালোচনা করছেন।",
+        },
+        "ACKNOWLEDGED": {
+            "en": "Territory officer has acknowledged. Keep selling — backup is being arranged.",
+            "bn": "এলাকা অফিসার বিষয়টি জেনে নিয়েছেন। বিক্রি চালিয়ে যান — ব্যাকআপের ব্যবস্থা চলছে।",
+        },
+        "UNDER_REVIEW": {
+            "en": "Escalated to the risk analyst for review. Continue normal transactions — analyst is matching your flow to recent event days.",
+            "bn": "ঝুঁকি বিশ্লেষকের কাছে পাঠানো হয়েছে। স্বাভাবিক লেনদেন চালিয়ে যান — বিশ্লেষক আপনার প্রবাহকে সাম্প্রতিক ইভেন্টের সাথে মিলিয়ে দেখছেন।",
+        },
+        "RESOLVED": {
+            "en": "Closed — shortage worked. Top-up delivered and burn normalized. Continue monitoring burn rate per minute.",
+            "bn": "সমাধান হয়েছে — স্বল্পতা মিটেছে। টপ-আপ পৌঁছেছে এবং বার্ন রেট স্বাভাবিক। প্রতি মিনিটে বার্ন রেট মনিটর করুন।",
+        },
+    },
+    "BEHAVIORAL_ANOMALY": {
+        "OPEN": {
+            "en": "Behavioral pattern flagged — your territory officer is reviewing. If the flagged customers are regulars, keep service as usual; if unfamiliar, request ID before large txns.",
+            "bn": "আচরণগত প্যাটার্ন চিহ্নিত — আপনার এলাকা অফিসার পর্যালোচনা করছেন। চিহ্নিত গ্রাহকরা নিয়মিত হলে স্বাভাবিক সেবা দিন; অপরিচিত হলে বড় লেনদেনের আগে পরিচয় যাচাই করুন।",
+        },
+        "ACKNOWLEDGED": {
+            "en": "Officer is monitoring. Maintain usual KYC steps for the flagged customer hashes until further notice.",
+            "bn": "অফিসার মনিটর করছেন। চিহ্নিত গ্রাহকদের জন্য স্বাভাবিক KYC পদক্ষেপ বজায় রাখুন।",
+        },
+        "UNDER_REVIEW": {
+            "en": "Risk analyst is reviewing flagged transactions. Cooperate if contacted; pause auto-large-txn approvals while review is open.",
+            "bn": "ঝুঁকি বিশ্লেষক চিহ্নিত লেনদেন পর্যালোচনা করছেন। যোগাযোগ করলে সহযোগিতা করুন; পর্যালোচনা চলাকালে বড় লেনদেনের স্বয়ংক্রিয় অনুমোদন বন্ধ রাখুন।",
+        },
+        "RESOLVED": {
+            "en": "Review complete. Resume standard operations. Contact officer/analyst for the audit report if needed.",
+            "bn": "পর্যালোচনা সম্পন্ন। স্বাভাবিক কার্যক্রম চালিয়ে যান। প্রয়োজনে অডিট রিপোর্টের জন্য অফিসার/বিশ্লেষকের সাথে যোগাযোগ করুন।",
+        },
+    },
+}
+
+
+def next_steps_for_alert(alert_type: str, ticket_status: Optional[str] = None) -> Dict[str, str]:
+    """Return `{"en": "...", "bn": "..."}` guidance for an alert.
+
+    `ticket_status` is the latest known status of the ticket linked to this
+    alert (None when no ticket has been opened yet). The agent sees:
+      - Step-by-step language guidance
+      - Bangla translation for regional field helpers
+
+    Falls back gracefully when alert_type or status is unknown.
+    """
+    typ = (alert_type or "").upper()
+    bucket = NEXT_STEPS_BY_TYPE.get(typ)
+    if not bucket:
+        return {
+            "en": "Alert raised. Stay alert — your officer will reach out shortly.",
+            "bn": "সতর্কতা জারি। সতর্ক থাকুন — অফিসার শীঘ্রই যোগাযোগ করবেন।",
+        }
+    if ticket_status is None:
+        st = "OPEN"
+    else:
+        st = str(ticket_status).upper()
+    return bucket.get(st, bucket.get("OPEN", {
+        "en": "Stay alert — officer is reviewing.",
+        "bn": "সতর্ক থাকুন — অফিসার পর্যালোচনা করছেন।",
+    }))
+
+
+def fmt_bdt(value: Decimal | float | int | str | None) -> str:
+    """Format a BDT value as "৳N,NNN". Accepts Decimal / float / int AND
+    string-encoded decimals (e.g. "68000.00") because some engine outputs
+    (predict_shortage's current_balance, shortage-warnings current_balance)
+    come back as Decimal-strings. Strings are coerced via Decimal so the
+    result is identical regardless of input type.
+    """
     if value is None:
         return "৳0"
-    n = int(value)
+    if isinstance(value, str):
+        try:
+            value = Decimal(value)
+        except Exception:
+            return "৳0"
+    try:
+        n = int(Decimal(str(value)))
+    except Exception:
+        return "৳0"
     s = f"{n:,}"
     return f"৳{s}"
 
@@ -170,6 +298,80 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
         for pid, v in by_provider.items()
     }
 
+    # ---------------------------------------------------------------
+    # Analytics-engine pass — surfaces inline per-card predictive +
+    # behavioral fields. We call `analyze()` (read-only) to fold the
+    # engine's master evidence into the dashboard payload. Catches
+    # both legacy-engine errors (KeyError on missing wallet) so the
+    # endpoint stays resilient if the agent's wallet row was wiped.
+    # ---------------------------------------------------------------
+    try:
+        from app.services.analytics_engine import analyze
+        evidence = analyze(db, agent_id, now_naive())
+    except Exception:
+        evidence = {
+            "liquidity": {},
+            "anomaly": {},
+            "correlated_providers": [],
+        }
+
+    # Build per-provider behavioral-anomaly summary used by the inline
+    # "⚠ N flagged customers" chip. Counts only the structured signals
+    # that the engine actually surfaced in this evaluation cycle.
+    anomaly_summary_by_provider: Dict[str, Dict[str, Any]] = {}
+    for pid in ("1", "2", "3"):
+        a = evidence.get("anomaly", {}).get(pid, {})
+        flagged = a.get("flagged_customers", []) or []
+        anomaly_summary_by_provider[pid] = {
+            "has_velocity": bool(a.get("velocity_anomaly")),
+            "has_structuring": bool(a.get("structuring_anomaly")),
+            "flagged_customer_count": len(flagged),
+            "composite_score": float(a.get("composite_score", 0.0)),
+            "derived_severity": a.get("derived_severity", "low"),
+        }
+
+    # Top-level shortage-warnings list — drives the dashboard's
+    # load-time toast and the "active shortage alerts" header. We
+    # build per-provider entries with formatted BDT + officer name so
+    # the JS layer can render them as-is.
+    shortage_warnings_payload: List[Dict[str, Any]] = []
+    for w in compute_shortage_warnings(evidence):
+        pid = w["provider_id"]
+        if pid == "shared_cash":
+            # Shared drawer has no per-provider officer; surfaced in
+            # physical card only, not in the per-provider chip row.
+            continue
+        try:
+            oid = route_to_officer(db, agent_id, pid)
+            oname = _office_name(db, oid)
+        except Exception:
+            oid, oname = "", ""
+        # Compute the per-provider recommended top-up so the toast can
+        # show "Top up ৳X" inline. Falls back to coarse estimate if
+        # the engine didn't produce a recommendation.
+        try:
+            from app.services.analytics_engine import recommend_topup
+            rec = recommend_topup(db, agent_id, pid, now_naive())
+            topup_amt = Decimal(str(rec.get("amount", "0")))
+        except Exception:
+            topup_amt = Decimal("0")
+        if topup_amt <= 0:
+            # Coarse fallback: cover 60 min of burn minus current balance.
+            burn = Decimal(str(w.get("burn_rate_weighted") or "0"))
+            cur = Decimal(str(w.get("current_balance") or "0"))
+            raw = max(Decimal("0"), burn * 60 - cur)
+            topup_amt = (raw / Decimal("100")).quantize(Decimal("1")) * Decimal("100")
+        shortage_warnings_payload.append({
+            "provider_id": pid,
+            "provider_name": PROVIDER_NAME.get(pid, pid),
+            "eta_minutes": int(w["eta_minutes"]) if w["eta_minutes"] is not None else None,
+            "current_balance_fmt": fmt_bdt(w.get("current_balance", "0")),
+            "burn_rate_weighted": w.get("burn_rate_weighted", "0"),
+            "recommended_topup_fmt": fmt_bdt(topup_amt),
+            "assigned_officer_id": oid,
+            "assigned_officer_name": oname,
+        })
+
     # Wallets for this agent (one per provider they're assigned to)
     wallets = db.exec(
         select(ProviderWallet).where(ProviderWallet.agent_id == agent_id)
@@ -183,9 +385,58 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
         {"id": "3", "name": "Rocket"},
     ]
     wallet_cards = []
+    # Pre-compute predictive + officer routing per provider so the
+    # cards carry the inline "Drains in N min" + "Routed to officer" +
+    # "Top up ৳X" lines that drive the early-shortage UX. We do this
+    # in a separate pass to keep the wallet-card loop below readable.
+    wallet_predict: dict[str, dict] = {}
+    wallet_officer: dict[str, tuple[str, str]] = {}
+    for p in all_providers:
+        try:
+            wallet_predict[p["id"]] = predict_shortage(db, agent_id, p["id"], now_naive())
+        except KeyError:
+            wallet_predict[p["id"]] = {"eta_minutes": None, "current_balance": "0"}
+        try:
+            oid = route_to_officer(db, agent_id, p["id"])
+            wallet_officer[p["id"]] = (oid, _office_name(db, oid))
+        except Exception:
+            wallet_officer[p["id"]] = ("", "")
+
     for p in all_providers:
         w = wallet_by_provider.get(p["id"])
         prov_totals = by_provider_net.get(p["id"], {"cash_in": 0.0, "cash_out": 0.0, "net": 0.0, "tx_count": 0})
+        pred = wallet_predict[p["id"]]
+        officer_id, officer_name = wallet_officer[p["id"]]
+        # predict_shortage returns eta_minutes as int, but defend against
+        # any upstream change that returns a numeric string.
+        eta_minutes = pred.get("eta_minutes")
+        if eta_minutes is None:
+            eta_int = None
+        elif isinstance(eta_minutes, int):
+            eta_int = eta_minutes
+        else:
+            try:
+                eta_int = int(float(eta_minutes))
+            except (TypeError, ValueError):
+                eta_int = None
+        # Top-up recommendation — pull from the engine when available,
+        # fall back to a coarse estimate from current balance + burn.
+        rec_amount = pred.get("recommended_topup")
+        if not rec_amount or rec_amount == "0.00":
+            burn = pred.get("burn_rate_weighted") or "0"
+            try:
+                burn_dec = Decimal(str(burn))
+                cur = Decimal(str(pred.get("current_balance") or "0"))
+                if burn_dec > 0 and cur < burn_dec * 60:
+                    rec_amount = str(
+                        (burn_dec * 60 - cur).quantize(Decimal("100"))
+                    )
+                else:
+                    rec_amount = "0"
+            except Exception:
+                rec_amount = "0"
+        rej_count = _rejected_count_for(agent_id, p["id"])
+        anom = anomaly_summary_by_provider.get(p["id"], {})
         if w is None:
             wallet_cards.append({
                 "provider_id": p["id"],
@@ -205,6 +456,15 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
                 "cash_out_fmt":   fmt_bdt(prov_totals["cash_out"]),
                 "net_fmt":        fmt_bdt(abs(prov_totals["net"])),
                 "direction":      "DRAINING" if prov_totals["net"] < 0 else "STABLE",
+                # Predictive + officer routing — kept on missing-wallet
+                # cards too so the agent sees "Routed to: …" even when
+                # the wallet row was wiped.
+                "eta_minutes": eta_int,
+                "eta_recommended_topup_fmt": fmt_bdt(rec_amount),
+                "assigned_officer_id": officer_id,
+                "assigned_officer_name": officer_name,
+                "rejected_count": rej_count,
+                "active_anomaly_summary": anom,
             })
             continue
 
@@ -246,6 +506,13 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
             "cash_out_fmt":   fmt_bdt(prov_totals["cash_out"]),
             "net_fmt":        fmt_bdt(abs(prov_totals["net"])),
             "direction":      "DRAINING" if prov_totals["net"] < 0 else "STABLE",
+            # Predictive + officer routing + rejections + behavior chip.
+            "eta_minutes": eta_int,
+            "eta_recommended_topup_fmt": fmt_bdt(rec_amount),
+            "assigned_officer_id": officer_id,
+            "assigned_officer_name": officer_name,
+            "rejected_count": rej_count,
+            "active_anomaly_summary": anom,
         })
 
     # Physical cash forecast (last 30 min velocity window)
@@ -257,6 +524,36 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
     ).all()
     out_v, in_v = velocity_bdt_per_min(all_txns, 30)
     physical_forecast = compute_t_runaway(agent.shared_physical_cash, out_v, in_v)
+
+    # Shared-drawer predict + top-up recommendation. Used by the
+    # physical card to surface "Drains in N min" + "Top up ৳X" lines.
+    try:
+        shared_pred = predict_shortage(db, agent_id, None, now_naive())
+        shared_eta = shared_pred.get("eta_minutes")
+        if shared_eta is None:
+            shared_eta_int = None
+        elif isinstance(shared_eta, int):
+            shared_eta_int = shared_eta
+        else:
+            try:
+                shared_eta_int = int(float(shared_eta))
+            except (TypeError, ValueError):
+                shared_eta_int = None
+        shared_rec = shared_pred.get("recommended_topup")
+    except Exception:
+        shared_pred = None
+        shared_eta_int = None
+        shared_rec = "0"
+    if not shared_rec or shared_rec == "0.00":
+        # Coarse fallback: cover 60 min of net burn.
+        burn = max(0.0, out_v - in_v)
+        cur = float(agent.shared_physical_cash)
+        if burn > 0 and cur < burn * 60:
+            raw = (burn * 60 - cur)
+            # round to nearest 100 BDT
+            shared_rec = str(int(round(raw / 100.0) * 100))
+        else:
+            shared_rec = "0"
 
     # Recent transactions (last 15) — for the live table view only.
     # Totals above are computed from sim_txns (all of them), not from
@@ -281,6 +578,22 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
         .order_by(Alert.created_at.desc())
         .limit(5)
     ).all()
+
+    # Tickets linked to each alert — drives the lifecycle chip ("OPEN →
+    # ACK → UNDER_REVIEW → RESOLVED") and the customer-support next-step
+    # panel on the agent dashboard. One alert can spawn N tickets (one
+    # per responsible provider); we attach ALL of them so the agent sees
+    # the full escalation chain, not just the first.
+    alert_ids = [a.alert_id for a in alerts]
+    tickets_by_alert: Dict[str, List[Ticket]] = {}
+    if alert_ids:
+        linked_tickets = db.exec(
+            select(Ticket)
+            .where(Ticket.alert_id.in_(alert_ids))
+            .order_by(Ticket.created_at.desc())
+        ).all()
+        for tk in linked_tickets:
+            tickets_by_alert.setdefault(tk.alert_id, []).append(tk)
 
     return {
         "agent": {
@@ -309,8 +622,22 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
             "cash_out_fmt":   fmt_bdt(overall_cash_out),
             "net_fmt":        fmt_bdt(abs(overall_net)),
             "direction":      "DRAINING" if overall_net < 0 else "STABLE",
+            # Predictive — surfaces "Drains in N min" + "Top up ৳X" inline
+            # under the physical balance. The shared drawer has no
+            # per-provider officer (the agent sees it themselves), so
+            # we leave assigned_officer_* empty here.
+            "eta_minutes": shared_eta_int,
+            "eta_recommended_topup_fmt": fmt_bdt(shared_rec),
+            "assigned_officer_id": "",
+            "assigned_officer_name": "",
         },
         "wallets": wallet_cards,
+        # Top-level shortage warnings — drives the dashboard's load-time
+        # toast and the "Active shortage alerts" header. Per-provider
+        # entries only (the shared-drawer warning lives in the physical
+        # card). Empty list when no balance is below the 120-min
+        # threshold.
+        "shortage_warnings": shortage_warnings_payload,
         # Authoritative draining totals — across every sim txn for this
         # agent, not just the last 15 in `recent_transactions`. Used by
         # the dashboard to show how much has actually drained, in BDT,
@@ -362,6 +689,37 @@ def resolve_agent_view(db: Session, agent_id: str) -> dict[str, Any]:
                 "message_bn": a.message_bn,
                 "confidence_score": float(a.confidence_score),
                 "created_at": a.created_at.strftime("%Y-%m-%d %H:%M"),
+                # Tickets = the escalation chain. When an alert was just
+                # raised (OPEN) the agent sees ONE ticket per responsible
+                # provider (officer hasn't responded yet). When the analyst
+                # has marked it RESOLVED, the agent sees "Closed — REAL /
+                # FALSE_POSITIVE" so they know exactly what action to take.
+                "tickets": [
+                    {
+                        "ticket_id": tk.ticket_id,
+                        "provider_id": tk.provider_id,
+                        "provider_name": PROVIDER_NAME.get(tk.provider_id, tk.provider_id),
+                        "status": tk.status.value if hasattr(tk.status, "value") else str(tk.status),
+                        "current_owner_role": tk.current_owner_role.value if hasattr(tk.current_owner_role, "value") else str(tk.current_owner_role),
+                        "assigned_officer_id": tk.assigned_officer_id,
+                        "assigned_officer_name": _office_name(db, tk.assigned_officer_id),
+                        "created_at": tk.created_at.strftime("%Y-%m-%d %H:%M"),
+                        "updated_at": tk.updated_at.strftime("%Y-%m-%d %H:%M"),
+                    }
+                    for tk in tickets_by_alert.get(a.alert_id, [])
+                ],
+                # Customer-support next-step suggestions. The advice is
+                # keyed by the alert's CURRENT ticket status, so when the
+                # officer escalates the agent automatically sees new
+                # guidance. Bangla translation included for regional
+                # field helpers. Never empty — falls back to a generic
+                # "stay alert" string when the alert type is unknown.
+                "next_steps": next_steps_for_alert(
+                    alert_type=a.alert_type.value if hasattr(a.alert_type, "value") else str(a.alert_type),
+                    ticket_status=(tickets_by_alert.get(a.alert_id, [None])[0].status.value
+                                   if tickets_by_alert.get(a.alert_id)
+                                   else None),
+                ),
             }
             for a in alerts
         ],

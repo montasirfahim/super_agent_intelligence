@@ -767,3 +767,199 @@ def test_pool_area_samples_uses_json_not_db():
     # Either peer samples found OR none (small dataset) — but no exception.
     assert isinstance(burn, list)
     assert isinstance(counts, list)
+
+
+# ---------------------------------------------------------------------------
+# 16. compute_shortage_warnings — pure function over analyze() output
+# ---------------------------------------------------------------------------
+
+def test_compute_shortage_warnings_emits_per_balance_below_threshold():
+    """Every balance with eta_minutes ≤ threshold emits a warning row.
+    Sorted ascending by eta. shared_cash included with provider_id='shared_cash'."""
+    evidence = {
+        "liquidity": {
+            "shared_cash": {"eta_minutes": 100, "current_balance": "1000.00",
+                            "burn_rate_weighted": "10.00", "confidence": "high"},
+            "1": {"eta_minutes": 45, "current_balance": "2000.00",
+                  "burn_rate_weighted": "44.44", "confidence": "high"},
+            "2": {"eta_minutes": 200, "current_balance": "50000.00",
+                  "burn_rate_weighted": "250.00", "confidence": "medium"},
+        }
+    }
+    warnings = ae.compute_shortage_warnings(evidence, threshold_minutes=120)
+    # shared_cash (100) and provider 1 (45) qualify. Provider 2 (200) doesn't.
+    assert len(warnings) == 2
+    # Sorted by eta ascending → provider 1 first (45), shared_cash second (100)
+    assert warnings[0]["provider_id"] == "1"
+    assert warnings[0]["eta_minutes"] == 45
+    assert warnings[0]["current_balance"] == "2000.00"
+    assert warnings[1]["provider_id"] == "shared_cash"
+    assert warnings[1]["eta_minutes"] == 100
+
+
+def test_compute_shortage_warnings_skips_none_eta():
+    """A balance with eta_minutes=None (zero or negative burn) must NOT
+    produce a warning row, even at threshold=120."""
+    evidence = {
+        "liquidity": {
+            "1": {"eta_minutes": None, "current_balance": "50000.00",
+                  "burn_rate_weighted": "0.00", "confidence": "low"},
+            "2": {"eta_minutes": 30, "current_balance": "3000.00",
+                  "burn_rate_weighted": "100.00", "confidence": "high"},
+        }
+    }
+    warnings = ae.compute_shortage_warnings(evidence, threshold_minutes=120)
+    assert len(warnings) == 1
+    assert warnings[0]["provider_id"] == "2"
+
+
+def test_severity_for_shortage_buckets():
+    """Critical ≤ 15, High ≤ 60, Medium > 60."""
+    assert ae.severity_for_shortage(10) == "CRITICAL"
+    assert ae.severity_for_shortage(15) == "CRITICAL"
+    assert ae.severity_for_shortage(16) == "HIGH"
+    assert ae.severity_for_shortage(60) == "HIGH"
+    assert ae.severity_for_shortage(61) == "MEDIUM"
+    assert ae.severity_for_shortage(120) == "MEDIUM"
+
+
+# ---------------------------------------------------------------------------
+# 17. build_alert_and_tickets: early-shortage bypass fires alert when
+#     overall_severity is "low" but a balance is about to deplete.
+# ---------------------------------------------------------------------------
+
+def test_shortage_warning_emitted_when_eta_below_threshold_low_severity(db, monkeypatch):
+    """When overall_severity='low' AND evidence['warnings'] is empty (today's
+    gate that would suppress everything), a balance with ETA ≤ 120 min
+    MUST still produce an alert and tickets. The result's mode is the new
+    'shortage_warning' path (alert is non-None, alert_type LIQUIDITY_SHORTAGE)."""
+    _seed_minimal(db)
+    t = datetime(2026, 7, 12, 10, 0)
+
+    # Stub analyze() so it returns overall_severity='low' and a low-balance
+    # ETA of 45 min for bKash.
+    def fake_analyze(_db, agent_id, _t, providers=None):
+        return {
+            "agent_id": agent_id, "evaluated_at": _t.isoformat(),
+            "liquidity": {
+                "shared_cash": {"eta_minutes": None, "eta_range_minutes": None,
+                                "confidence": "low", "burn_rate_weighted": "0.00",
+                                "change_pct": 0.0, "current_balance": "50000.00",
+                                "relative_uncertainty": 0.0},
+                "1": {"eta_minutes": 45, "eta_range_minutes": [40, 50],
+                      "confidence": "high", "burn_rate_weighted": "44.44",
+                      "change_pct": 50.0, "current_balance": "2000.00",
+                      "relative_uncertainty": 0.1},
+            },
+            "recommended_topup": {"amount": "2000.00", "target_coverage_minutes": 60},
+            "anomaly": {
+                "1": {"velocity_anomaly": False, "velocity_score": 1.0,
+                      "triggering_window": None, "structuring_anomaly": False,
+                      "structuring_ratio": 0.0, "flagged_customers": []},
+            },
+            "correlated_providers": [], "overall_severity": "low",
+            "warnings": [], "data_quality_flag": False, "shared_uncertainty": 0.0,
+        }
+    monkeypatch.setattr(ae, "analyze", fake_analyze)
+    monkeypatch.setattr(ae, "recommend_topup", lambda *a, **k: {
+        "amount": "5000.00", "target_coverage_minutes": 60,
+    })
+
+    result = ae.build_alert_and_tickets(db, "a1", t, providers=["1"])
+    # alert created despite overall_severity=low because shortage bypass fired
+    assert result["alert"] is not None, "Shortage bypass should produce an alert"
+    # severity bucketed by ETA (45 → HIGH)
+    assert result["alert"]["severity"] == "high", (
+        f"expected severity=high for ETA=45, got {result['alert']['severity']}"
+    )
+    # shortage_warnings populated
+    assert len(result["shortage_warnings"]) == 1
+    assert result["shortage_warnings"][0]["provider_id"] == "1"
+    assert result["shortage_warnings"][0]["eta_minutes"] == 45
+
+
+def test_no_shortage_warning_when_eta_above_threshold(db, monkeypatch):
+    """When every balance's ETA is above the threshold, the gate suppresses
+    the alert (mode=silent). No shortage_warnings rows."""
+    _seed_minimal(db)
+    t = datetime(2026, 7, 12, 10, 0)
+
+    def fake_analyze(_db, agent_id, _t, providers=None):
+        return {
+            "agent_id": agent_id, "evaluated_at": _t.isoformat(),
+            "liquidity": {
+                "shared_cash": {"eta_minutes": None, "eta_range_minutes": None,
+                                "confidence": "low", "burn_rate_weighted": "0.00",
+                                "change_pct": 0.0, "current_balance": "100000.00",
+                                "relative_uncertainty": 0.0},
+                "1": {"eta_minutes": 240, "eta_range_minutes": [200, 280],
+                      "confidence": "high", "burn_rate_weighted": "10.00",
+                      "change_pct": 5.0, "current_balance": "2400.00",
+                      "relative_uncertainty": 0.05},
+            },
+            "recommended_topup": {"amount": "0.00", "target_coverage_minutes": 60},
+            "anomaly": {
+                "1": {"velocity_anomaly": False, "velocity_score": 1.0,
+                      "triggering_window": None, "structuring_anomaly": False,
+                      "structuring_ratio": 0.0, "flagged_customers": []},
+            },
+            "correlated_providers": [], "overall_severity": "low",
+            "warnings": [], "data_quality_flag": False, "shared_uncertainty": 0.0,
+        }
+    monkeypatch.setattr(ae, "analyze", fake_analyze)
+
+    result = ae.build_alert_and_tickets(db, "a1", t, providers=["1"])
+    assert result["alert"] is None, "ETA=240 (above threshold) should suppress alert"
+    assert result["shortage_warnings"] == []
+
+
+def test_shortage_warning_routing_emits_one_ticket_per_responsible_provider(db, monkeypatch):
+    """When 2 providers both have ETA ≤ 120 min, both receive a ticket."""
+    _seed_minimal(db)
+    db.add(Provider(id="2", provider_name="Nagad"))
+    db.add(TerritoryOffice(id="to2", name="TO-2", provider_id="2",
+                           div_id="dhk", area_name="Dhaka", risk_analyst_id="ra1"))
+    db.add(ProviderWallet(wallet_id="w2", agent_id="a1", provider_id="2",
+                          e_money_balance=Decimal("1000.00"),
+                          last_sync_time=datetime(2026, 7, 12, 10, 0)))
+    db.commit()
+    t = datetime(2026, 7, 12, 10, 0)
+
+    def fake_analyze(_db, agent_id, _t, providers=None):
+        return {
+            "agent_id": agent_id, "evaluated_at": _t.isoformat(),
+            "liquidity": {
+                "shared_cash": {"eta_minutes": None, "eta_range_minutes": None,
+                                "confidence": "low", "burn_rate_weighted": "0.00",
+                                "change_pct": 0.0, "current_balance": "100000.00",
+                                "relative_uncertainty": 0.0},
+                "1": {"eta_minutes": 30, "eta_range_minutes": [25, 35],
+                      "confidence": "high", "burn_rate_weighted": "100.00",
+                      "change_pct": 100.0, "current_balance": "3000.00",
+                      "relative_uncertainty": 0.1},
+                "2": {"eta_minutes": 90, "eta_range_minutes": [80, 100],
+                      "confidence": "high", "burn_rate_weighted": "11.11",
+                      "change_pct": 50.0, "current_balance": "1000.00",
+                      "relative_uncertainty": 0.05},
+            },
+            "recommended_topup": {"amount": "10000.00", "target_coverage_minutes": 60},
+            "anomaly": {
+                "1": {"velocity_anomaly": False, "velocity_score": 1.0,
+                      "triggering_window": None, "structuring_anomaly": False,
+                      "structuring_ratio": 0.0, "flagged_customers": []},
+                "2": {"velocity_anomaly": False, "velocity_score": 1.0,
+                      "triggering_window": None, "structuring_anomaly": False,
+                      "structuring_ratio": 0.0, "flagged_customers": []},
+            },
+            "correlated_providers": [], "overall_severity": "low",
+            "warnings": [], "data_quality_flag": False, "shared_uncertainty": 0.0,
+        }
+    monkeypatch.setattr(ae, "analyze", fake_analyze)
+    monkeypatch.setattr(ae, "recommend_topup", lambda *a, **k: {
+        "amount": "5000.00", "target_coverage_minutes": 60,
+    })
+
+    result = ae.build_alert_and_tickets(db, "a1", t, providers=["1", "2"])
+    assert result["alert"] is not None
+    routed = {tk["provider_id"] for tk in result["tickets"]}
+    assert routed == {"1", "2"}, f"expected both providers at shortage, got {routed}"

@@ -79,17 +79,26 @@ def evaluate(
     if result["alert"] is None:
         return {
             "ok": True,
+            "mode": result.get("mode", "silent"),
             "alert_id": None,
             "tickets": [],
+            "shortage_warnings": result.get("shortage_warnings", []),
             "message": "No alert-worthy conditions detected.",
         }
 
     alert_d = result["alert"]
 
-    # Map lowercase severity string → SeverityLevel enum. The engine emits
-    # "low"/"medium"/"high" (no "critical"), so we map "high" → HIGH and
-    # "critical" would only arrive via direct callers (not produced here).
-    sev_map = {"low": SeverityLevel.LOW, "medium": SeverityLevel.MEDIUM, "high": SeverityLevel.HIGH}
+    # Map lowercase severity string → SeverityLevel enum. The engine now
+    # emits "low"/"medium"/"high"/"critical" — critical is the bucket for
+    # shortage warnings with ETA ≤ 15 min (see
+    # analytics_engine.severity_for_shortage). Default to MEDIUM for any
+    # unrecognised value to be safe.
+    sev_map = {
+        "low": SeverityLevel.LOW,
+        "medium": SeverityLevel.MEDIUM,
+        "high": SeverityLevel.HIGH,
+        "critical": SeverityLevel.CRITICAL,
+    }
     severity_enum = sev_map.get(str(alert_d["severity"]).lower(), SeverityLevel.MEDIUM)
 
     alert_row = Alert(
@@ -124,13 +133,21 @@ def evaluate(
         # value yet, so we use ACKNOWLEDGE — the notes_text makes the
         # creation intent explicit. A future migration can add a CREATED
         # enum value without breaking existing rows (we'd backfill once).
+        # When the alert came from the early-shortage path, we tag the
+        # notes with [SHORTAGE_WARNING] so audit readers can distinguish
+        # the proactive warning tickets from anomaly-driven ones.
+        mode_tag = (
+            " [SHORTAGE_WARNING]"
+            if result.get("mode") == "anomaly" and result.get("shortage_warnings")
+            else ""
+        )
         audit_row = AuditLog(
             log_id=f"audit_{tk['ticket_id']}_created",
             ticket_id=tk["ticket_id"],
             action_taken=AuditAction.ACKNOWLEDGE,
             performed_by_role="SYSTEM",
             notes_text=(
-                f"CREATED by analytics engine ({ctx.role}={ctx.user_id}); "
+                f"CREATED by analytics engine{mode_tag} ({ctx.role}={ctx.user_id}); "
                 f"alert_type={alert_d['alert_type']}, severity={alert_d['severity']}"
             ),
             timestamp=tk["created_at"],
@@ -145,8 +162,13 @@ def evaluate(
 
     return {
         "ok": True,
+        "mode": result.get("mode", "anomaly"),
         "alert_id": alert_d["alert_id"],
         "alert_type": alert_d["alert_type"],
         "severity": alert_d["severity"],
         "tickets": ticket_ids,
+        # Echo the shortage-warnings slice so the caller (UI toaster /
+        # tests) can render inline ETA chips without re-querying. Empty
+        # list when this alert came from the anomaly path.
+        "shortage_warnings": result.get("shortage_warnings", []),
     }
